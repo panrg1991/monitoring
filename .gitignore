@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.db
+*.db-shm
+*.db-wal
+# 数据库备份（如 mesmonitor.db.bak-20261119085552、mesmonitor.db.bak），仅用于本地回滚，不提交
+*.db.bak
+*.db.bak-*
+*.db.bak.*
+server.log
+stats_job.log
+tests/tmp/

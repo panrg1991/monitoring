@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 语法检查
+        run: |
+          node --check server.js
+          node --check stats_job.js
+
+      - name: 构建前端
+        run: npm run build
+
+      - name: 接口与业务规则测试
+        run: npm test
+
+      - name: 依赖漏洞审计
+        run: npm audit --audit-level=high
+        continue-on-error: true
