@@ -1,4 +1,5 @@
 const http = require('http');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -13,13 +14,138 @@ db.pragma('foreign_keys = ON');
 
 const PORT = Number(process.env.PORT) || 3456;
 
-// 管理令牌：设置后所有 POST 接口必须携带 X-Admin-Token（默认空 = 不启用，兼容内网单机部署）
+// 机器令牌：设置后脚本可携带 X-Admin-Token 调用接口（等同超级管理员，用于曲线采集 / 定时统计等自动化任务）
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 // 跨域白名单：仅在配置后返回 CORS 头（默认同源部署，不开放跨域）
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').trim();
-// 请求体与日志上限
-const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES) || 1024 * 1024;
-const LOG_MAX_BYTES = Number(process.env.LOG_MAX_BYTES) || 5 * 1024 * 1024;
+// 请求体与日志上限（非法 / 过小配置回落到默认值，避免误配导致所有写请求被拒）
+const MAX_BODY_BYTES = Math.max(1024, Number(process.env.MAX_BODY_BYTES) || 1024 * 1024);
+const LOG_MAX_BYTES = Math.max(1024, Number(process.env.LOG_MAX_BYTES) || 5 * 1024 * 1024);
+// 历史数据保留天数：0 = 不清理（默认），仅清理日志 / 呼叫 / 统计派生表
+const HISTORY_RETENTION_DAYS = Math.max(0, Number(process.env.HISTORY_RETENTION_DAYS) || 0);
+
+// ==================== 登录与权限配置 ====================
+const AUTH_COOKIE = 'mes_session';
+// 会话有效期（小时）：默认 12，前端仅保存 HttpOnly Cookie，令牌不落 localStorage
+const SESSION_TTL_HOURS = Math.max(1, Math.min(720, Number(process.env.SESSION_TTL_HOURS) || 12));
+const DEFAULT_ADMIN_USER = (process.env.DEFAULT_ADMIN_USER || 'admin').trim() || 'admin';
+// 初始超管密码：必须显式配置；未配置时首次建库随机生成并仅打印一次，避免默认弱口令
+const CONFIGURED_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '').trim();
+// 反向代理：默认不信任 X-Forwarded-For（否则攻击者可伪造 IP 绕过登录锁定）
+const TRUST_PROXY = /^(1|true|yes|on)$/i.test(String(process.env.TRUST_PROXY || '').trim());
+// HTTPS 部署时置 1，会话 Cookie 追加 Secure
+const COOKIE_SECURE = /^(1|true|yes|on)$/i.test(String(process.env.COOKIE_SECURE || '').trim());
+// 登录失败锁定：同一 IP + 用户名连续失败达到阈值后锁定一段时间
+const LOGIN_MAX_FAILS = Math.max(3, Number(process.env.LOGIN_MAX_FAILS) || 5);
+const LOGIN_LOCK_SECONDS = Math.max(10, Number(process.env.LOGIN_LOCK_SECONDS) || 60);
+// 登录并发上限：scrypt 校验在 libuv 线程池执行，限制并发避免占满 CPU / 排队
+const LOGIN_MAX_CONCURRENT = Math.max(1, Number(process.env.LOGIN_MAX_CONCURRENT) || 8);
+let loginInFlight = 0;
+
+// 车间看板（显示端）页面清单：可分配给用户
+const DISPLAY_PAGES = [
+  { key: 'home', label: '首页' },
+  { key: 'thermal', label: '热成像' },
+  { key: 'pipeline', label: '管路控制' },
+  { key: 'recipe', label: '模具配方' },
+  { key: 'andon', label: '安灯呼叫' },
+  { key: 'process', label: '工艺数据' },
+  { key: 'chart', label: '曲线分析' },
+  { key: 'stats', label: '生产统计' },
+  { key: 'plan', label: '生产计划' },
+];
+
+// 后台管理页面清单：可分配给用户
+const ADMIN_PAGES = [
+  { key: 'device', label: '设备管理' },
+  { key: 'product', label: '产品管理' },
+  { key: 'mold', label: '模具档案' },
+  { key: 'recipe', label: '模具配方' },
+  { key: 'pipeline', label: '管路控制' },
+  { key: 'andon', label: '安灯呼叫' },
+  { key: 'analysis', label: '数据分析' },
+  { key: 'chart', label: '曲线分析' },
+  { key: 'stats', label: '生产统计' },
+  { key: 'plan', label: '生产计划' },
+  { key: 'user', label: '用户权限' },
+];
+
+// 按钮级动作清单：按模块分组，前端据此渲染勾选项，后端据此校验写接口
+const ACTION_CATALOG = [
+  { key: 'device', label: '设备管理', actions: [{ key: 'create', label: '新增' }, { key: 'update', label: '修改' }, { key: 'delete', label: '删除' }] },
+  { key: 'product', label: '产品管理', actions: [{ key: 'create', label: '新增' }, { key: 'update', label: '修改' }, { key: 'delete', label: '删除' }] },
+  { key: 'mold', label: '模具档案', actions: [{ key: 'create', label: '新增' }, { key: 'update', label: '修改' }, { key: 'delete', label: '删除' }] },
+  { key: 'recipe', label: '模具配方', actions: [{ key: 'create', label: '新增' }, { key: 'update', label: '修改' }, { key: 'delete', label: '删除' }] },
+  { key: 'pipeline', label: '管路控制', actions: [{ key: 'update', label: '参数下发' }] },
+  { key: 'andon', label: '安灯呼叫', actions: [{ key: 'create', label: '发起呼叫' }, { key: 'respond', label: '响应/完成' }] },
+  { key: 'analysis', label: '数据分析', actions: [{ key: 'config', label: '标准配置' }] },
+  { key: 'stats', label: '生产统计', actions: [{ key: 'config', label: '班次/重算' }] },
+  { key: 'plan', label: '生产计划', actions: [{ key: 'create', label: '新建' }, { key: 'update', label: '修改' }, { key: 'delete', label: '删除' }, { key: 'operate', label: '开始/暂停/完成' }] },
+  { key: 'user', label: '用户权限', actions: [{ key: 'create', label: '新增用户' }, { key: 'update', label: '修改用户' }, { key: 'delete', label: '删除用户' }] },
+];
+
+const DISPLAY_PAGE_KEYS = DISPLAY_PAGES.map((p) => p.key);
+const ADMIN_PAGE_KEYS = ADMIN_PAGES.map((p) => p.key);
+const ALL_ACTION_KEYS = ACTION_CATALOG.flatMap((m) => m.actions.map((a) => `${m.key}:${a.key}`));
+
+// 写接口 → 所需动作权限（未列出的写接口仅要求登录）
+const WRITE_API_PERMISSIONS = [
+  { pattern: /^\/api\/devices\/(create)$/, module: 'device', action: 'create' },
+  { pattern: /^\/api\/devices\/(update)$/, module: 'device', action: 'update' },
+  { pattern: /^\/api\/devices\/(delete)$/, module: 'device', action: 'delete' },
+  { pattern: /^\/api\/products\/(create)$/, module: 'product', action: 'create' },
+  { pattern: /^\/api\/products\/(update)$/, module: 'product', action: 'update' },
+  { pattern: /^\/api\/products\/(delete)$/, module: 'product', action: 'delete' },
+  { pattern: /^\/api\/molds\/(create)$/, module: 'mold', action: 'create' },
+  { pattern: /^\/api\/molds\/(update)$/, module: 'mold', action: 'update' },
+  { pattern: /^\/api\/molds\/(delete)$/, module: 'mold', action: 'delete' },
+  { pattern: /^\/api\/recipes\/(create)$/, module: 'recipe', action: 'create' },
+  { pattern: /^\/api\/recipes\/(update)$/, module: 'recipe', action: 'update' },
+  { pattern: /^\/api\/recipes\/(delete)$/, module: 'recipe', action: 'delete' },
+  { pattern: /^\/api\/pipeline\/update$/, module: 'pipeline', action: 'update' },
+  { pattern: /^\/api\/andon\/call$/, module: 'andon', action: 'create' },
+  { pattern: /^\/api\/andon\/(respond|complete)$/, module: 'andon', action: 'respond' },
+  { pattern: /^\/api\/analysis\/versions\/(create|update|delete)$/, module: 'analysis', action: 'config' },
+  { pattern: /^\/api\/analysis\/standards\/(create|update|delete|reorder)$/, module: 'analysis', action: 'config' },
+  { pattern: /^\/api\/stats\/shifts\/(create|update|delete|init)$/, module: 'stats', action: 'config' },
+  { pattern: /^\/api\/stats\/rebuild$/, module: 'stats', action: 'config' },
+  { pattern: /^\/api\/plans\/create$/, module: 'plan', action: 'create' },
+  { pattern: /^\/api\/plans\/update$/, module: 'plan', action: 'update' },
+  { pattern: /^\/api\/plans\/delete$/, module: 'plan', action: 'delete' },
+  { pattern: /^\/api\/plans\/status$/, module: 'plan', action: 'operate' },
+  { pattern: /^\/api\/auth\/users\/(create)$/, module: 'user', action: 'create' },
+  { pattern: /^\/api\/auth\/users\/(update)$/, module: 'user', action: 'update' },
+  { pattern: /^\/api\/auth\/users\/(delete)$/, module: 'user', action: 'delete' },
+];
+
+// 读接口 → 命中所属页面即可读取（任一命中即放行）
+const READ_API_MODULES = [
+  { prefix: '/api/devices', modules: ['device', 'home', 'stats'] },
+  { prefix: '/api/products', modules: ['product', 'mold', 'recipe', 'plan', 'stats'] },
+  { prefix: '/api/molds', modules: ['mold', 'recipe', 'plan', 'stats'] },
+  { prefix: '/api/recipes', modules: ['recipe', 'plan'] },
+  { prefix: '/api/pipeline', modules: ['pipeline'] },
+  { prefix: '/api/andon', modules: ['andon', 'home'] },
+  { prefix: '/api/thermal', modules: ['thermal', 'home'] },
+  { prefix: '/api/process', modules: ['process', 'chart', 'analysis'] },
+  { prefix: '/api/analysis', modules: ['analysis'] },
+  { prefix: '/api/stats', modules: ['stats'] },
+  { prefix: '/api/plans', modules: ['plan'] },
+  { prefix: '/api/auth/users', modules: ['user'] },
+];
+
+// 无需登录即可访问的接口：健康检查 + 登录 + 会话查询 + 看板首页数据
+const PUBLIC_API_PATHS = new Set([
+  '/health',
+  '/api/auth/login',
+  '/api/auth/logout',
+  '/api/auth/me',
+  '/api/devices/overview',
+  '/api/devices/alarm-log',
+]);
+
+// 登录失败计数：key = `${ip}|${username}`
+const loginFailures = new Map();
 
 // ==================== 数据源约定 ====================
 // 工艺数据表 process_data 是全系统唯一的数据源：
@@ -123,13 +249,21 @@ function logWrite(level, message) {
   console.log(line.trim());
 }
 
+// 查询串脱敏：token / key / secret / password 等参数值打码后再落盘
+function redactQueryString(query) {
+  return String(query).replace(
+    /([?&][^=&#]*(?:token|key|secret|password|passwd|pwd)[^=&#]*=)([^&#]*)/gi,
+    '$1***'
+  );
+}
+
 function logRequest(method, pathname, body) {
   const query = pathname.includes('?') ? pathname.slice(pathname.indexOf('?')) : '';
   let msg = `${method} ${pathname.replace(/\?.*$/, '')}`;
   if (body && typeof body === 'object' && Object.keys(body).length > 0) {
     msg += ` | body: ${JSON.stringify(maskLogObject(body))}`;
   }
-  if (query) msg += ` | query${maskLogValue('query', query)}`;
+  if (query) msg += ` | query${redactQueryString(query)}`;
   logWrite('REQUEST', msg);
 }
 
@@ -149,11 +283,22 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
 };
 
-// 静态资源安全响应头（防 MIME 嗅探 / 点击劫持）
+// 静态资源安全响应头（防 MIME 嗅探 / 点击劫持 / 内容注入）
 const STATIC_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'SAMEORIGIN',
   'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'self'",
+  ].join('; '),
 };
 
 // 拼接并校验路径，越出根目录（目录穿越）时返回 null
@@ -171,7 +316,37 @@ function safeJoin(rootDir, pathname) {
   return target;
 }
 
-// 静态文件服务（优先提供 dist/ 构建产物，其次回退根目录）
+function sendStaticFile(res, filePath) {
+  const ext = path.extname(filePath);
+  if (!MIME[ext]) return false;
+  syncReadAndSend(res, filePath, MIME[ext]);
+  return true;
+}
+
+function syncReadAndSend(res, filePath, contentType) {
+  try {
+    const content = fs.readFileSync(filePath);
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': content.length,
+      'Cache-Control': 'no-cache',
+      ...STATIC_HEADERS,
+    });
+    res.end(content);
+  } catch {
+    sendNotFound(res);
+  }
+}
+
+function sendNotFound(res) {
+  res.writeHead(404, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    ...STATIC_HEADERS,
+  });
+  res.end('Not Found');
+}
+
+// 静态文件服务：只从 dist（Vite 构建产物）读取，不暴露项目源码 / 配置文件
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   let pathname = url.pathname;
@@ -179,45 +354,23 @@ function serveStatic(req, res) {
   // 管理端独立入口：/admin → dist/admin.html（显示端仍为 / → index.html）
   if (pathname === '/admin' || pathname === '/admin/') pathname = '/admin.html';
 
-  // 1. 优先从 dist（Vite 构建产物）提供服务
   const distRoot = path.join(__dirname, 'dist');
   const distPath = safeJoin(distRoot, pathname);
   if (distPath && fs.existsSync(distPath) && fs.statSync(distPath).isFile()) {
-    const ext = path.extname(distPath);
-    if (MIME[ext]) {
-      const content = fs.readFileSync(distPath);
-      res.writeHead(200, { 'Content-Type': MIME[ext], ...STATIC_HEADERS });
-      res.end(content);
+    if (sendStaticFile(res, distPath)) return;
+  }
+
+  // SPA 回退：仅对「无扩展名」的页面路由返回 dist/index.html，
+  // 缺失的静态资源（.js / .json 等）一律 404，避免把源码或配置当页面返回
+  if (!path.extname(pathname)) {
+    const distIndex = path.join(distRoot, 'index.html');
+    if (fs.existsSync(distIndex)) {
+      syncReadAndSend(res, distIndex, MIME['.html']);
       return;
     }
   }
 
-  // 2. SPA 回退：非静态资源请求时返回 dist/index.html
-  const distIndex = path.join(distRoot, 'index.html');
-  if (fs.existsSync(distIndex)) {
-    const content = fs.readFileSync(distIndex);
-    res.writeHead(200, { 'Content-Type': MIME['.html'], ...STATIC_HEADERS });
-    res.end(content);
-    return;
-  }
-
-  // 3. 回退：从项目根目录提供旧静态文件（同样做目录穿越校验）
-  const filePath = safeJoin(__dirname, pathname);
-  const ext = filePath ? path.extname(filePath) : '';
-  if (!filePath || !MIME[ext]) {
-    res.writeHead(404);
-    res.end('Not Found');
-    return;
-  }
-
-  try {
-    const content = fs.readFileSync(filePath);
-    res.writeHead(200, { 'Content-Type': MIME[ext], ...STATIC_HEADERS });
-    res.end(content);
-  } catch {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
+  sendNotFound(res);
 }
 
 // 健康检查：供负载均衡 / 监控探活，不依赖业务表
@@ -238,12 +391,42 @@ function healthCheck(req, res) {
 
 // ==================== 通用参数解析 ====================
 const PAGE_SIZE_MAX = 200;
+// 页码上限：防止 page=1e9 触发超大 OFFSET 全表扫描
+const PAGE_MAX = 10000;
 
-// 统一分页参数：page ≥ 1，pageSize 限定在 1 ~ 200，避免超大分页拖垮服务
+// 统一分页参数：page 限定 1 ~ 10000，pageSize 限定在 1 ~ 200，避免超大分页拖垮服务
 function parsePaging(url, defaultSize = 10) {
-  const page = Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1);
+  const page = Math.min(PAGE_MAX, Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1));
   const rawSize = parseInt(url.searchParams.get('pageSize'), 10) || defaultSize;
   return { page, pageSize: Math.min(PAGE_SIZE_MAX, Math.max(1, rawSize)) };
+}
+
+// ==================== 入参校验工具 ====================
+// 严格日历校验（含当月天数）：避免 2026-13-45 / 2026-02-31 写入业务表
+function isValidDateParts(year, month, day) {
+  if (!(year >= 1970 && year <= 2999)) return false;
+  if (!(month >= 1 && month <= 12)) return false;
+  if (!(day >= 1 && day <= 31)) return false;
+  const dt = new Date(year, month - 1, day);
+  return dt.getFullYear() === year && dt.getMonth() === month - 1 && dt.getDate() === day;
+}
+
+// 标量文本：对象 / 数组等非标量按空值处理，避免把 "[object Object]" 写进库
+function toText(value) {
+  if (value === null || value === undefined) return '';
+  const type = typeof value;
+  if (type === 'string') return value.trim();
+  if (type === 'number' || type === 'boolean') return String(value);
+  return '';
+}
+
+// 严格有限数字：空串 / NaN / Infinity 一律视为非法（返回 null）
+function toFiniteNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 // JSON 响应（带日志）
@@ -275,9 +458,9 @@ function getDeviceOverview(req, res) {
   const stats = db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN latest_status='running' THEN 1 ELSE 0 END) AS running,
-      SUM(CASE WHEN latest_status='warning' THEN 1 ELSE 0 END) AS warning,
-      SUM(CASE WHEN latest_status='error'   THEN 1 ELSE 0 END) AS error
+      COALESCE(SUM(CASE WHEN latest_status='running' THEN 1 ELSE 0 END), 0) AS running,
+      COALESCE(SUM(CASE WHEN latest_status='warning' THEN 1 ELSE 0 END), 0) AS warning,
+      COALESCE(SUM(CASE WHEN latest_status='error'   THEN 1 ELSE 0 END), 0) AS error
     FROM (
       SELECT COALESCE(ds.status, 'running') AS latest_status
       FROM devices d
@@ -309,6 +492,9 @@ const DEVICE_EDITABLE_FIELDS = [
   'device_name', 'device_type', 'device_code', 'location',
   'model', 'manufacturer', 'install_date', 'description', 'is_active',
 ];
+
+// 设备编号变更需要在事务内批量改写工艺数据/计划/统计，引用量过大时拒绝并引导迁移
+const DEVICE_CODE_SYNC_MAX_ROWS = Math.max(1000, Number(process.env.DEVICE_CODE_SYNC_MAX_ROWS) || 20000);
 
 function deviceUsageCount(deviceCode) {
   if (!deviceCode) return 0;
@@ -376,47 +562,55 @@ function validateDeviceUnique(code, name, excludeId) {
 
 // POST /api/devices/create - 新增设备
 function createDevice(req, res, body) {
-  const name = String((body && body.device_name) || '').trim();
-  const code = String((body && body.device_code) || '').trim();
-  const type = String((body && body.device_type) || '').trim();
+  const name = toText(body && body.device_name);
+  const code = toText(body && body.device_code);
+  const type = toText(body && body.device_type);
   if (!name) return json(res, { error: '缺少设备名称' }, 400);
   if (!code) return json(res, { error: '缺少设备编号' }, 400);
   if (!type) return json(res, { error: '缺少设备类型' }, 400);
   const dup = validateDeviceUnique(code, name, null);
   if (dup) return json(res, { error: dup }, 400);
 
-  const info = db.prepare(`
-    INSERT INTO devices
-      (device_name, device_type, device_code, location, model, manufacturer, install_date, description, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    name, type, code,
-    String(body.location || '').trim(),
-    String(body.model || '').trim(),
-    String(body.manufacturer || '').trim(),
-    String(body.install_date || '').trim(),
-    String(body.description || '').trim(),
-    body.is_active == null ? 1 : (Number(body.is_active) ? 1 : 0)
-  );
+  // 设备主表 + 初始状态 + 状态历史必须一起成功，避免留下没有状态的设备
+  let newId = null;
+  const tx = db.transaction(() => {
+    const info = db.prepare(`
+      INSERT INTO devices
+        (device_name, device_type, device_code, location, model, manufacturer, install_date, description, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      name, type, code,
+      toText(body.location),
+      toText(body.model),
+      toText(body.manufacturer),
+      toText(body.install_date),
+      toText(body.description),
+      body.is_active == null ? 1 : (Number(body.is_active) ? 1 : 0)
+    );
+    newId = info.lastInsertRowid;
 
-  // 新设备默认写入一条运行状态，保证首页监控可见
-  db.prepare(`
-    INSERT INTO device_status (device_id, status, alarm_info, detail_info)
-    VALUES (?, 'running', '正常开机', '设备已新增')
-  `).run(info.lastInsertRowid);
-  db.prepare(`
-    INSERT INTO device_status_history (device_id, status, alarm_info, detail_info, start_time)
-    VALUES (?, 'running', '正常开机', '设备已新增', datetime('now','localtime'))
-  `).run(info.lastInsertRowid);
+    // 新设备默认写入一条运行状态，保证首页监控可见
+    db.prepare(`
+      INSERT INTO device_status (device_id, status, alarm_info, detail_info)
+      VALUES (?, 'running', '正常开机', '设备已新增')
+    `).run(newId);
+    db.prepare(`
+      INSERT INTO device_status_history (device_id, status, alarm_info, detail_info, start_time)
+      VALUES (?, 'running', '正常开机', '设备已新增', datetime('now','localtime'))
+    `).run(newId);
+  });
+  tx();
 
-  const record = db.prepare('SELECT * FROM devices WHERE id = ?').get(info.lastInsertRowid);
+  const record = db.prepare('SELECT * FROM devices WHERE id = ?').get(newId);
   json(res, { success: true, device: record });
 }
 
 // POST /api/devices/update - 修改设备
 function updateDevice(req, res, body) {
   const id = Number(body && body.id);
-  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+  const device = Number.isSafeInteger(id) && id > 0
+    ? db.prepare('SELECT * FROM devices WHERE id = ?').get(id)
+    : null;
   if (!device) return json(res, { error: '设备不存在' }, 404);
 
   const next = { ...device };
@@ -424,12 +618,12 @@ function updateDevice(req, res, body) {
     if (body[field] === undefined || body[field] === null) return;
     next[field] = field === 'is_active'
       ? (Number(body[field]) ? 1 : 0)
-      : String(body[field]).trim();
+      : toText(body[field]);
   });
 
-  const name = String(next.device_name || '').trim();
-  const code = String(next.device_code || '').trim();
-  const type = String(next.device_type || '').trim();
+  const name = toText(next.device_name);
+  const code = toText(next.device_code);
+  const type = toText(next.device_type);
   if (!name) return json(res, { error: '缺少设备名称' }, 400);
   if (!code) return json(res, { error: '缺少设备编号' }, 400);
   if (!type) return json(res, { error: '缺少设备类型' }, 400);
@@ -437,11 +631,32 @@ function updateDevice(req, res, body) {
   if (dup) return json(res, { error: dup }, 400);
 
   let syncedRows = 0;
+  let syncedPlanRows = 0;
+  let syncedStatRows = 0;
+  const oldCode = device.device_code;
+  // 大批量同步会长时间持有写锁（单进程同步 SQLite 下全站阻塞），超阈值要求走迁移流程
+  if (oldCode && code !== oldCode) {
+    const used = deviceUsageCount(oldCode);
+    if (used > DEVICE_CODE_SYNC_MAX_ROWS) {
+      return json(res, {
+        error: `该设备已有 ${used} 条工艺数据，修改编号会造成长时间锁库；请新建编号 ${code} 的设备并按需迁移数据`,
+      }, 400);
+    }
+  }
   const tx = db.transaction(() => {
-    // 设备编号变更时，同步更新工艺数据中的关联编号，避免出现孤立引用
-    if (device.device_code && code !== device.device_code) {
+    // 设备编号变更时，同步所有按编号关联的表，避免出现孤立引用：
+    // 工艺数据、生产计划（含执行段通过 plan_id 关联，无需改）、生产统计
+    if (oldCode && code !== oldCode) {
       syncedRows = db.prepare('UPDATE process_data SET device_code = ? WHERE device_code = ?')
-        .run(code, device.device_code).changes;
+        .run(code, oldCode).changes;
+      if (tableExists('production_plans')) {
+        syncedPlanRows = db.prepare('UPDATE production_plans SET device_code = ? WHERE device_code = ?')
+          .run(code, oldCode).changes;
+      }
+      if (tableExists('production_stats')) {
+        syncedStatRows = db.prepare('UPDATE production_stats SET device_code = ? WHERE device_code = ?')
+          .run(code, oldCode).changes;
+      }
     }
     db.prepare(`
       UPDATE devices
@@ -451,14 +666,20 @@ function updateDevice(req, res, body) {
       WHERE id = ?
     `).run(
       name, type, code,
-      next.location || '', next.model || '', next.manufacturer || '',
-      next.install_date || '', next.description || '', Number(next.is_active) ? 1 : 0, id
+      toText(next.location), toText(next.model), toText(next.manufacturer),
+      toText(next.install_date), toText(next.description), Number(next.is_active) ? 1 : 0, id
     );
   });
   tx();
 
   const record = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
-  json(res, { success: true, device: record, syncedProcessRows: syncedRows });
+  json(res, {
+    success: true,
+    device: record,
+    syncedProcessRows: syncedRows,
+    syncedPlanRows,
+    syncedStatRows,
+  });
 }
 
 // POST /api/devices/delete - 删除设备
@@ -528,22 +749,6 @@ function deviceOptionList() {
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     return String(a.device_code).localeCompare(String(b.device_code));
   });
-}
-
-// GET /api/devices/:id/alarm - 设备报警历史
-function getDeviceAlarm(req, res, id) {
-  const device = db.prepare('SELECT device_name FROM devices WHERE id = ?').get(id);
-  if (!device) return json(res, { error: '设备不存在' }, 404);
-
-  const logs = db.prepare(`
-    SELECT start_time AS time, alarm_info AS message, detail_info
-    FROM device_status_history
-    WHERE device_id = ?
-    ORDER BY start_time DESC
-    LIMIT 20
-  `).all(id);
-
-  json(res, { device_name: device.device_name, logs });
 }
 
 // GET /api/devices/alarm-log - 按设备名称查报警
@@ -999,10 +1204,13 @@ function recipeFiltersFromUrl(url) {
   };
 }
 
-// 全量查询（兼容旧接口 / 导出）
-function queryRecipes(filters) {
+// 全量查询（兼容旧接口）；limit > 0 时限制返回条数，避免导出先全查再截断
+function queryRecipes(filters, limit = 0) {
   const { where, params } = recipeWhere(filters);
-  return db.prepare(`${RECIPE_SELECT}${where} ORDER BY mr.id`).all(...params);
+  const sql = `${RECIPE_SELECT}${where} ORDER BY mr.id${limit > 0 ? ' LIMIT ?' : ''}`;
+  return limit > 0
+    ? db.prepare(sql).all(...params, limit)
+    : db.prepare(sql).all(...params);
 }
 
 // GET /api/recipes - 模具配方搜索（返回数组，product / mold 支持 id 或名称关键字）
@@ -1036,7 +1244,7 @@ function listRecipes(req, res) {
 // GET /api/recipes/export - 配方导出（CSV，按当前筛选条件导出全部记录）
 function exportRecipes(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const rows = queryRecipes(recipeFiltersFromUrl(url)).slice(0, EXPORT_MAX_ROWS);
+  const rows = queryRecipes(recipeFiltersFromUrl(url), EXPORT_MAX_ROWS);
   const flagText = (value) => (value === '是' || String(value) === '1' ? '开启' : '关闭');
 
   const headers = [
@@ -1216,15 +1424,27 @@ function updatePipeline(req, res, body) {
     { name: '阀门开度', value: valve },
   ];
 
+  // 只接受有限数字：Infinity / NaN / 非标量会被拒绝并返回 400
+  const invalid = [];
+  for (const u of updates) {
+    if (u.value === null || u.value === undefined || toText(u.value) === '') continue;
+    const num = toFiniteNumber(u.value);
+    if (num === null) invalid.push(u.name);
+    else u.value = num;
+  }
+  if (invalid.length) {
+    return json(res, { error: `${invalid.join('、')} 必须为有效数字` }, 400);
+  }
+
   const updateStmt = db.prepare('UPDATE pipeline_params SET param_value = ?, updated_at = datetime(\'now\',\'localtime\') WHERE param_name = ?');
   const logStmt = db.prepare('INSERT INTO pipeline_edit_log (param_name, old_value, new_value, edit_time) VALUES (?, ?, ?, datetime(\'now\',\'localtime\'))');
 
   const transaction = db.transaction(() => {
     for (const u of updates) {
-      if (u.value == null || isNaN(Number(u.value))) continue;
+      if (u.value === null || u.value === undefined || toText(u.value) === '') continue;
       const old = db.prepare('SELECT param_value FROM pipeline_params WHERE param_name = ?').get(u.name);
-      updateStmt.run(Number(u.value), u.name);
-      logStmt.run(u.name, old ? old.param_value : 0, Number(u.value));
+      updateStmt.run(u.value, u.name);
+      logStmt.run(u.name, old ? old.param_value : 0, u.value);
     }
   });
 
@@ -1254,18 +1474,23 @@ function getAndonCalls(req, res) {
 
 // POST /api/andon/call - 发起呼叫
 function createAndonCall(req, res, body) {
-  const { call_type, call_detail, caller } = body;
-  if (!call_type) return json(res, { error: '缺少呼叫类型' }, 400);
+  const callType = toText(body && body.call_type);
+  const callDetail = toText(body && body.call_detail);
+  const caller = toText(body && body.caller) || '系统自动';
+  if (!callType) return json(res, { error: '缺少呼叫类型' }, 400);
 
-  const result = db.prepare(`
-    INSERT INTO andon_calls (call_type, call_detail, caller, call_time, status)
-    VALUES (?, ?, ?, datetime('now','localtime'), 'pending')
-  `).run(call_type, call_detail || '', caller || '系统自动');
+  // 呼叫记录与发起日志同事务，避免出现无日志的呼叫
+  let newId = null;
+  db.transaction(() => {
+    const result = db.prepare(`
+      INSERT INTO andon_calls (call_type, call_detail, caller, call_time, status)
+      VALUES (?, ?, ?, datetime('now','localtime'), 'pending')
+    `).run(callType, callDetail, caller);
+    newId = result.lastInsertRowid;
+    addAndonLog(newId, 'create', operatorName(req, caller), `发起【${callType}】呼叫`);
+  })();
 
-  // 记录发起呼叫日志
-  addAndonLog(result.lastInsertRowid, 'create', caller || '系统自动', `发起【${call_type}】呼叫`);
-
-  const record = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(result.lastInsertRowid);
+  const record = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(newId);
   json(res, { success: true, call: record });
 }
 
@@ -1279,20 +1504,27 @@ function addAndonLog(callId, action, operator, content) {
 
 // POST /api/andon/respond - 响应呼叫 (pending -> processing)
 function respondAndonCall(req, res, body) {
-  const { id, handler } = body;
-  if (!id) return json(res, { error: '缺少呼叫ID' }, 400);
+  const id = Number(body && body.id);
+  const handler = toText(body && body.handler) || '未指定';
+  if (!Number.isSafeInteger(id) || id <= 0) return json(res, { error: '缺少呼叫ID' }, 400);
 
   const call = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(id);
   if (!call) return json(res, { error: '呼叫记录不存在' }, 404);
-  if (call.status !== 'pending') return json(res, { error: '只有待响应状态的呼叫才能响应' }, 400);
 
-  db.prepare(`
-    UPDATE andon_calls
-    SET status = 'processing', handler = ?, handle_time = datetime('now','localtime')
-    WHERE id = ?
-  `).run(handler || '未指定', id);
-
-  addAndonLog(id, 'respond', handler || '未指定', '响应呼叫，开始处理');
+  // 以状态条件做原子更新，避免先查后改的并发窗口
+  let updated = 0;
+  db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE andon_calls
+      SET status = 'processing', handler = ?, handle_time = datetime('now','localtime')
+      WHERE id = ? AND status = 'pending'
+    `).run(handler, id);
+    updated = info.changes;
+    if (updated) {
+      addAndonLog(id, 'respond', operatorName(req, handler), `响应呼叫，开始处理（处理人 ${handler}）`);
+    }
+  })();
+  if (!updated) return json(res, { error: '只有待响应状态的呼叫才能响应' }, 400);
 
   const record = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(id);
   json(res, { success: true, call: record });
@@ -1300,21 +1532,31 @@ function respondAndonCall(req, res, body) {
 
 // POST /api/andon/complete - 完成呼叫 (processing -> completed)
 function completeAndonCall(req, res, body) {
-  const { id, handle_remark, operator } = body;
-  if (!id) return json(res, { error: '缺少呼叫ID' }, 400);
+  const id = Number(body && body.id);
+  const handleRemark = toText(body && body.handle_remark);
+  const operator = toText(body && body.operator);
+  if (!Number.isSafeInteger(id) || id <= 0) return json(res, { error: '缺少呼叫ID' }, 400);
 
   const call = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(id);
   if (!call) return json(res, { error: '呼叫记录不存在' }, 404);
   if (call.status === 'completed') return json(res, { error: '该呼叫已完成' }, 400);
   if (call.status === 'cancelled') return json(res, { error: '该呼叫已取消' }, 400);
+  if (call.status !== 'processing') return json(res, { error: '请先响应该呼叫，再标记完成' }, 400);
 
-  db.prepare(`
-    UPDATE andon_calls
-    SET status = 'completed', handle_remark = ?, handle_time = datetime('now','localtime')
-    WHERE id = ?
-  `).run(handle_remark || '', id);
-
-  addAndonLog(id, 'complete', operator || call.handler || '系统', `完成处理：${handle_remark || '无备注'}`);
+  // 以状态条件做原子更新，避免并发重复完成
+  let updated = 0;
+  db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE andon_calls
+      SET status = 'completed', handle_remark = ?, handle_time = datetime('now','localtime')
+      WHERE id = ? AND status = 'processing'
+    `).run(handleRemark, id);
+    updated = info.changes;
+    if (updated) {
+      addAndonLog(id, 'complete', operatorName(req, operator || call.handler || '系统'), `完成处理：${handleRemark || '无备注'}`);
+    }
+  })();
+  if (!updated) return json(res, { error: '请先响应该呼叫，再标记完成' }, 400);
 
   const record = db.prepare('SELECT * FROM andon_calls WHERE id = ?').get(id);
   json(res, { success: true, call: record });
@@ -1341,8 +1583,15 @@ function getProcessData(req, res) {
   const device = url.searchParams.get('device') || '';
   const product = url.searchParams.get('product') || '';
   const batch = url.searchParams.get('batch') || '';
-  const startTime = url.searchParams.get('startTime') || '';
-  const endTime = url.searchParams.get('endTime') || '';
+  const rawStart = (url.searchParams.get('startTime') || '').trim();
+  const rawEnd = (url.searchParams.get('endTime') || '').trim();
+  const startTime = rawStart ? normalizeExportTime(rawStart, false) : '';
+  const endTime = rawEnd ? normalizeExportTime(rawEnd, true) : '';
+  if (rawStart && !startTime) return json(res, { error: '开始时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (rawEnd && !endTime) return json(res, { error: '结束时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (startTime && endTime && startTime > endTime) {
+    return json(res, { error: '开始时间不能晚于结束时间' }, 400);
+  }
   const status = url.searchParams.get('status') || '';
 
   let where = 'WHERE 1=1';
@@ -1397,8 +1646,15 @@ function getProcessChart(req, res) {
 
   const device = url.searchParams.get('device') || '';
   const product = url.searchParams.get('product') || '';
-  const startTime = (url.searchParams.get('startTime') || '').replace('T', ' ').trim();
-  const endTime = (url.searchParams.get('endTime') || '').replace('T', ' ').trim();
+  const rawStart = (url.searchParams.get('startTime') || '').trim();
+  const rawEnd = (url.searchParams.get('endTime') || '').trim();
+  const startTime = rawStart ? normalizeExportTime(rawStart, false) : '';
+  const endTime = rawEnd ? normalizeExportTime(rawEnd, true) : '';
+  if (rawStart && !startTime) return json(res, { error: '开始时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (rawEnd && !endTime) return json(res, { error: '结束时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (startTime && endTime && startTime > endTime) {
+    return json(res, { error: '开始时间不能晚于结束时间' }, 400);
+  }
   const byRange = !!(startTime || endTime);
 
   let where = 'WHERE 1=1';
@@ -1440,8 +1696,13 @@ function getProcessChart(req, res) {
 function exportProcessData(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const win = exportDateWindow();
-  const startTime = normalizeExportTime(url.searchParams.get('startTime'), false) || `${win.startDate} 00:00:00`;
-  const endTime = normalizeExportTime(url.searchParams.get('endTime'), true) || `${win.endDate} 23:59:59`;
+  const rawStart = (url.searchParams.get('startTime') || '').trim();
+  const rawEnd = (url.searchParams.get('endTime') || '').trim();
+  const startTime = rawStart ? normalizeExportTime(rawStart, false) : `${win.startDate} 00:00:00`;
+  const endTime = rawEnd ? normalizeExportTime(rawEnd, true) : `${win.endDate} 23:59:59`;
+  if (!startTime) return json(res, { error: '开始时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (!endTime) return json(res, { error: '结束时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM' }, 400);
+  if (startTime > endTime) return json(res, { error: '开始时间不能晚于结束时间' }, 400);
 
   const device = url.searchParams.get('device') || '';
   const product = url.searchParams.get('product') || '';
@@ -1502,17 +1763,20 @@ function csvCell(value) {
 }
 
 // 输出 CSV（带 BOM，保证 Excel 打开中文不乱码）
+// 逐行流式写出，避免把整份导出内容拼成一个大字符串 / Buffer 占满内存
 function sendCsv(res, filename, headers, rows) {
-  const lines = [headers.map(csvCell).join(',')];
-  for (const row of rows) lines.push(row.map(csvCell).join(','));
-  const buf = Buffer.from(`\uFEFF${lines.join('\r\n')}`, 'utf8');
   logResponse(res._reqMethod || 'GET', res._reqPath || '', 200, `导出 ${rows.length} 条`);
   res.writeHead(200, {
     'Content-Type': 'text/csv; charset=utf-8',
     'Content-Disposition': `attachment; filename="export.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`,
-    'Content-Length': buf.length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
   });
-  res.end(buf);
+  res.write(`\uFEFF${headers.map(csvCell).join(',')}\r\n`);
+  for (const row of rows) {
+    res.write(`${row.map(csvCell).join(',')}\r\n`);
+  }
+  res.end();
 }
 
 function exportDateWindow() {
@@ -1525,13 +1789,21 @@ function exportStamp() {
   return `${formatDateStr(d).replace(/-/g, '')}_${pad2(d.getHours())}${pad2(d.getMinutes())}`;
 }
 
-// 'YYYY-MM-DD' / 'YYYY-MM-DDTHH:mm' → 'YYYY-MM-DD HH:mm:ss'
+// 'YYYY-MM-DD' / 'YYYY-MM-DDTHH:mm' → 'YYYY-MM-DD HH:mm:ss'；非法日历值返回 ''
 function normalizeExportTime(value, isEnd) {
-  const v = String(value || '').trim().replace('T', ' ');
+  const v = String(value == null ? '' : value).trim().replace('T', ' ');
   if (!v) return '';
-  if (v.length <= 10) return `${v} ${isEnd ? '23:59:59' : '00:00:00'}`;
-  if (v.length === 16) return `${v}:${isEnd ? '59' : '00'}`;
-  return v;
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(v)) {
+    const d = parseDateStr(v);
+    if (!d) return '';
+    return `${formatDateStr(d)} ${isEnd ? '23:59:59' : '00:00:00'}`;
+  }
+  const base = normalizePlanTime(v);
+  if (!base) return '';
+  if (/^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}$/.test(v)) {
+    return `${base.slice(0, 16)}:${isEnd ? '59' : '00'}`;
+  }
+  return base;
 }
 
 // ==================== 历史工件分析模块 ====================
@@ -1601,8 +1873,10 @@ function judgeRecord(row, standards) {
     const tol = Math.abs(Number(s.tolerance) || 0);
     const diff = value - stdValue;
     const abs = Math.abs(diff);
+    // 引入极小 epsilon，避免 0.1+0.2 这类浮点表示误差把边界值误判为超差
+    const EPS = 1e-9;
     let level = 0;
-    if (abs > tol) level = abs <= tol * 2 ? 1 : 2;
+    if (abs > tol + EPS) level = abs <= tol * 2 + EPS ? 1 : 2;
     if (level > worst) worst = level;
     if (level > 0) {
       details.push(`${s.param_name}${diff > 0 ? '+' : ''}${diff.toFixed(2)}${s.unit || ''}${level === 2 ? '超差' : '预警'}`);
@@ -1628,8 +1902,12 @@ function getAnalysisData(req, res) {
   const keyword = url.searchParams.get('keyword') || '';
   const device = url.searchParams.get('device') || '';
   const product = url.searchParams.get('product') || '';
-  const startTime = url.searchParams.get('startTime') || '';
-  const endTime = url.searchParams.get('endTime') || '';
+  const rawStart = (url.searchParams.get('startTime') || '').trim();
+  const rawEnd = (url.searchParams.get('endTime') || '').trim();
+  const startTime = rawStart ? normalizePlanTime(rawStart) : '';
+  const endTime = rawEnd ? normalizePlanTime(rawEnd) : '';
+  if (rawStart && !startTime) return json(res, { error: '开始时间格式应为 YYYY-MM-DD HH:MM' }, 400);
+  if (rawEnd && !endTime) return json(res, { error: '结束时间格式应为 YYYY-MM-DD HH:MM' }, 400);
 
   let where = 'WHERE 1=1';
   const params = [];
@@ -1642,10 +1920,23 @@ function getAnalysisData(req, res) {
   if (startTime) { where += ' AND collect_time >= ?'; params.push(startTime); }
   if (endTime) { where += ' AND collect_time <= ?'; params.push(endTime); }
 
+  // 只查询判定需要的列（元信息 + 被标准引用的工艺参数），避免 SELECT * 撑大内存
+  const dataColumns = tableColumns('process_data');
+  const standardParamKeys = [...new Set(
+    db.prepare('SELECT DISTINCT param_key FROM analysis_standards WHERE is_active = 1').all()
+      .map((r) => r.param_key)
+  )].filter((key) => dataColumns.includes(key) && !PROCESS_META_COLUMNS.includes(key));
+  const analysisColumns = [
+    'id', 'collect_time', 'device_code', 'product_model', 'batch_no', 'workpiece_no', 'data_status', 'remark',
+    ...standardParamKeys,
+  ].filter((key, index, arr) => dataColumns.includes(key) && arr.indexOf(key) === index);
+  const selectSql = analysisColumns.length ? analysisColumns.join(', ') : 'id';
+
   // 判定需要全量合格率，因此按上限扫描（避免数据增长后无界占用内存）
-  const ANALYSIS_MAX_SCAN = 50000;
+  // 可通过 ANALYSIS_MAX_SCAN 调整；值越大单次请求阻塞越久
+  const ANALYSIS_MAX_SCAN = Math.max(1000, Number(process.env.ANALYSIS_MAX_SCAN) || 20000);
   const rows = db.prepare(`
-    SELECT * FROM process_data ${where}
+    SELECT ${selectSql} FROM process_data ${where}
     ORDER BY collect_time DESC, id DESC
     LIMIT ${ANALYSIS_MAX_SCAN}
   `).all(...params);
@@ -1676,10 +1967,17 @@ function getAnalysisData(req, res) {
   });
 
   const total = judged.length;
-  const unqualified = judged.filter(r => r.judge_result === 'unqualified').length;
-  const warning = judged.filter(r => r.judge_result === 'warning').length;
-  const qualified = judged.filter(r => r.judge_result === 'qualified').length;
-  const noStandard = judged.filter(r => r.judge_result === 'no_standard').length;
+  // 单次遍历完成分类统计，避免对大数组重复 filter
+  let unqualified = 0;
+  let warning = 0;
+  let qualified = 0;
+  let noStandard = 0;
+  for (const row of judged) {
+    if (row.judge_result === 'unqualified') unqualified += 1;
+    else if (row.judge_result === 'warning') warning += 1;
+    else if (row.judge_result === 'qualified') qualified += 1;
+    else noStandard += 1;
+  }
   const rate = (n) => (total > 0 ? ((n / total) * 100).toFixed(1) : '0.0');
 
   // 表格展示列：所有涉及版本的标准参数并集（同一参数只保留首次出现的定义）
@@ -1703,7 +2001,10 @@ function getAnalysisData(req, res) {
     }))
     .sort((a, b) => (a.display_order - b.display_order));
 
-  const offset = (page - 1) * pageSize;
+  // 分页与其他列表接口保持一致：越界页回落到最后一页
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const offset = (safePage - 1) * pageSize;
   const pageRows = judged.slice(offset, offset + pageSize);
 
   // 仅下发当前页涉及版本的标准明细，由前端按 standard_version_id 取用
@@ -1716,8 +2017,9 @@ function getAnalysisData(req, res) {
 
   json(res, {
     total,
-    page,
+    page: safePage,
     pageSize,
+    totalPages,
     truncated,
     qualifiedCount: qualified,
     warningCount: warning,
@@ -1775,23 +2077,32 @@ function getAnalysisFilters(req, res) {
 // ==================== 分析标准维护（数据库内可增删改，按时间段生效） ====================
 
 function addStandardLog(versionId, versionCode, action, target, content, operator) {
+  // 统一走 toText：对象 / 数组等非标量不会写进日志，也不会触发绑定异常
   db.prepare(`
     INSERT INTO analysis_standard_logs (version_id, version_code, action, target, content, operator)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(versionId || null, versionCode || '', action, target || '', content || '', operator || '系统');
+  `).run(versionId || null, toText(versionCode), toText(action), toText(target), toText(content), toText(operator) || '系统');
 }
 
+// 'YYYY-MM-DD' / 'YYYY-MM-DD HH:mm[:ss]' → 'YYYY-MM-DD HH:mm:ss'，非法日历值返回 ''
 function normalizeDateTime(value) {
   if (!value) return '';
   let s = String(value).trim().replace('T', ' ');
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) s += ':00';
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += ' 00:00:00';
-  return s.slice(0, 19);
+  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) s += ':00';
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(s);
+  if (!m) return '';
+  const [year, month, day, hour, minute, second] = [
+    Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]),
+  ];
+  if (!isValidDateParts(year, month, day)) return '';
+  if (hour > 23 || minute > 59 || second > 59) return '';
+  return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
 }
 
+// 标准值 / 容差解析：空串与 Infinity 都视为非法
 function toNumber(value) {
-  const n = Number(value);
-  return Number.isNaN(n) ? null : n;
+  return toFiniteNumber(value);
 }
 
 // GET /api/analysis/versions - 标准版本列表（含明细） + 可选用参数清单
@@ -1823,15 +2134,19 @@ function getAnalysisVersions(req, res) {
 
 // POST /api/analysis/versions - 新增标准版本
 function createAnalysisVersion(req, res, body) {
-  const { version_code, version_name, product_model, effective_from, effective_to, remark, operator } = body || {};
-  const name = (version_name || '').trim();
-  const from = normalizeDateTime(effective_from);
-  const to = normalizeDateTime(effective_to);
+  const payload = body || {};
+  const name = toText(payload.version_name);
+  const product = toText(payload.product_model);
+  const rawFrom = toText(payload.effective_from);
+  const rawTo = toText(payload.effective_to);
+  const from = normalizeDateTime(rawFrom);
+  const to = normalizeDateTime(rawTo);
   if (!name) return json(res, { error: '缺少版本名称' }, 400);
-  if (!from) return json(res, { error: '缺少生效开始时间' }, 400);
+  if (!from) return json(res, { error: '生效开始时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' }, 400);
+  if (rawTo && !to) return json(res, { error: '生效结束时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' }, 400);
   if (to && to < from) return json(res, { error: '生效结束时间不能早于开始时间' }, 400);
 
-  let code = (version_code || '').trim();
+  let code = toText(payload.version_code);
   if (!code) {
     const seed = from.slice(0, 10).replace(/-/g, '');
     code = `STD-${seed}`;
@@ -1848,10 +2163,10 @@ function createAnalysisVersion(req, res, body) {
     INSERT INTO analysis_standard_versions
       (version_code, version_name, product_model, effective_from, effective_to, remark)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(code, name, (product_model || '').trim() || null, from, to || null, remark || '');
+  `).run(code, name, product || null, from, to || null, toText(payload.remark));
 
   addStandardLog(info.lastInsertRowid, code, 'create_version', name,
-    `新增标准版本，有效期 ${from} ~ ${to || '至今'}，适用产品 ${(product_model || '').trim() || '全部'}`, operator);
+    `新增标准版本，有效期 ${from} ~ ${to || '至今'}，适用产品 ${product || '全部'}`, operatorName(req));
 
   const record = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(info.lastInsertRowid);
   json(res, { success: true, version: record });
@@ -1859,29 +2174,37 @@ function createAnalysisVersion(req, res, body) {
 
 // POST /api/analysis/versions/update - 修改标准版本
 function updateAnalysisVersion(req, res, body) {
-  const { id, version_name, product_model, effective_from, effective_to, remark, is_active, operator } = body || {};
-  const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(id);
+  const payload = body || {};
+  const id = Number(payload.id);
+  const version = Number.isSafeInteger(id) && id > 0
+    ? db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(id)
+    : null;
   if (!version) return json(res, { error: '标准版本不存在' }, 404);
 
-  const name = (version_name != null ? String(version_name) : version.version_name).trim();
-  const from = normalizeDateTime(effective_from != null ? effective_from : version.effective_from);
-  const to = normalizeDateTime(effective_to != null ? effective_to : version.effective_to);
+  const name = (payload.version_name != null ? toText(payload.version_name) : toText(version.version_name));
+  const rawFrom = payload.effective_from != null ? toText(payload.effective_from) : (version.effective_from || '');
+  const rawTo = payload.effective_to != null ? toText(payload.effective_to) : (version.effective_to || '');
+  const from = normalizeDateTime(rawFrom);
+  const to = normalizeDateTime(rawTo);
   if (!name) return json(res, { error: '缺少版本名称' }, 400);
-  if (!from) return json(res, { error: '缺少生效开始时间' }, 400);
+  if (!from) return json(res, { error: '生效开始时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' }, 400);
+  if (rawTo && !to) return json(res, { error: '生效结束时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' }, 400);
   if (to && to < from) return json(res, { error: '生效结束时间不能早于开始时间' }, 400);
 
-  const product = (product_model != null ? String(product_model) : (version.product_model || '')).trim() || null;
-  const active = is_active != null ? (Number(is_active) ? 1 : 0) : version.is_active;
+  const product = (payload.product_model != null ? toText(payload.product_model) : toText(version.product_model)) || null;
+  const active = payload.is_active != null ? (Number(payload.is_active) ? 1 : 0) : version.is_active;
+  const remark = payload.remark != null ? toText(payload.remark) : toText(version.remark);
 
   db.prepare(`
     UPDATE analysis_standard_versions
     SET version_name = ?, product_model = ?, effective_from = ?, effective_to = ?,
         remark = ?, is_active = ?, updated_at = datetime('now','localtime')
     WHERE id = ?
-  `).run(name, product, from, to || null, remark != null ? remark : (version.remark || ''), active, id);
+  `).run(name, product, from, to || null, remark, active, id);
 
   addStandardLog(id, version.version_code, 'update_version', name,
-    `修改标准版本：有效期 ${from} ~ ${to || '至今'}，适用产品 ${product || '全部'}，状态 ${active ? '启用' : '停用'}`, operator);
+    `修改标准版本：有效期 ${from} ~ ${to || '至今'}，适用产品 ${product || '全部'}，状态 ${active ? '启用' : '停用'}`,
+    operatorName(req));
 
   const record = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(id);
   json(res, { success: true, version: record });
@@ -1889,54 +2212,63 @@ function updateAnalysisVersion(req, res, body) {
 
 // POST /api/analysis/versions/delete - 删除标准版本（连同其标准明细）
 function deleteAnalysisVersion(req, res, body) {
-  const { id, operator } = body || {};
-  const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(id);
+  const payload = body || {};
+  const id = Number(payload.id);
+  const version = Number.isSafeInteger(id) && id > 0
+    ? db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(id)
+    : null;
   if (!version) return json(res, { error: '标准版本不存在' }, 404);
 
-  db.prepare('DELETE FROM analysis_standards WHERE version_id = ?').run(id);
-  db.prepare('DELETE FROM analysis_standard_versions WHERE id = ?').run(id);
-  addStandardLog(id, version.version_code, 'delete_version', version.version_name,
-    '删除标准版本及其全部标准明细', operator);
+  // 明细、版本、审计日志必须一起成功
+  db.transaction(() => {
+    db.prepare('DELETE FROM analysis_standards WHERE version_id = ?').run(id);
+    db.prepare('DELETE FROM analysis_standard_versions WHERE id = ?').run(id);
+    addStandardLog(id, version.version_code, 'delete_version', version.version_name,
+      '删除标准版本及其全部标准明细', operatorName(req));
+  })();
 
   json(res, { success: true });
 }
 
 // POST /api/analysis/standards/create - 新增标准参数（参数必须存在于工艺数据表）
 function createAnalysisStandard(req, res, body) {
-  const { version_id, param_key, param_name, standard_value, tolerance, unit, display_order, operator } = body || {};
-  const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(version_id);
+  const payload = body || {};
+  const versionId = Number(payload.version_id);
+  const version = Number.isSafeInteger(versionId) && versionId > 0
+    ? db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(versionId)
+    : null;
   if (!version) return json(res, { error: '标准版本不存在' }, 404);
 
-  const key = (param_key || '').trim();
+  const key = toText(payload.param_key);
   if (!key) return json(res, { error: '缺少工艺参数' }, 400);
   if (!processParamColumns().includes(key)) {
     return json(res, { error: `工艺数据表中不存在参数 ${key}，无法作为分析标准` }, 400);
   }
-  if (db.prepare('SELECT id FROM analysis_standards WHERE version_id = ? AND param_key = ?').get(version_id, key)) {
+  if (db.prepare('SELECT id FROM analysis_standards WHERE version_id = ? AND param_key = ?').get(versionId, key)) {
     return json(res, { error: '该版本已包含此参数标准' }, 400);
   }
 
-  const stdValue = toNumber(standard_value);
-  const tol = toNumber(tolerance);
+  const stdValue = toNumber(payload.standard_value);
+  const tol = toNumber(payload.tolerance);
   if (stdValue === null) return json(res, { error: '标准值必须为数字' }, 400);
   if (tol === null || tol < 0) return json(res, { error: '容差必须为不小于 0 的数字' }, 400);
 
   const meta = PROCESS_PARAM_META[key] || {};
-  const name = (param_name || '').trim() || meta.name || key;
-  const u = (unit || '').trim() || meta.unit || '';
-  const order = toNumber(display_order);
+  const name = toText(payload.param_name) || meta.name || key;
+  const u = toText(payload.unit) || meta.unit || '';
+  const order = toNumber(payload.display_order);
   const nextOrder = order !== null ? order : (db.prepare(
     'SELECT COALESCE(MAX(display_order), 0) + 1 AS n FROM analysis_standards WHERE version_id = ?'
-  ).get(version_id).n);
+  ).get(versionId).n);
 
   const info = db.prepare(`
     INSERT INTO analysis_standards
       (version_id, param_name, param_key, standard_value, tolerance, unit, display_order)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(version_id, name, key, stdValue, tol, u, nextOrder);
+  `).run(versionId, name, key, stdValue, tol, u, nextOrder);
 
-  addStandardLog(version_id, version.version_code, 'create', name,
-    `新增标准参数 ${name}：${stdValue} ± ${tol} ${u}`, operator);
+  addStandardLog(versionId, version.version_code, 'create', name,
+    `新增标准参数 ${name}：${stdValue} ± ${tol} ${u}`, operatorName(req));
 
   const record = db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(info.lastInsertRowid);
   json(res, { success: true, standard: record });
@@ -1944,19 +2276,22 @@ function createAnalysisStandard(req, res, body) {
 
 // POST /api/analysis/standards/update - 修改标准参数
 function updateAnalysisStandard(req, res, body) {
-  const { id, param_name, standard_value, tolerance, unit, display_order, is_active, operator } = body || {};
-  const std = db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(id);
+  const payload = body || {};
+  const id = Number(payload.id);
+  const std = Number.isSafeInteger(id) && id > 0
+    ? db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(id)
+    : null;
   if (!std) return json(res, { error: '标准参数不存在' }, 404);
 
-  const stdValue = standard_value != null ? toNumber(standard_value) : Number(std.standard_value);
-  const tol = tolerance != null ? toNumber(tolerance) : Number(std.tolerance);
+  const stdValue = payload.standard_value != null ? toNumber(payload.standard_value) : Number(std.standard_value);
+  const tol = payload.tolerance != null ? toNumber(payload.tolerance) : Number(std.tolerance);
   if (stdValue === null) return json(res, { error: '标准值必须为数字' }, 400);
   if (tol === null || tol < 0) return json(res, { error: '容差必须为不小于 0 的数字' }, 400);
 
-  const name = (param_name != null ? String(param_name) : std.param_name).trim() || std.param_name;
-  const u = unit != null ? String(unit).trim() : (std.unit || '');
-  const order = display_order != null ? (toNumber(display_order) ?? std.display_order) : std.display_order;
-  const active = is_active != null ? (Number(is_active) ? 1 : 0) : std.is_active;
+  const name = (payload.param_name != null ? toText(payload.param_name) : toText(std.param_name)) || std.param_name;
+  const u = payload.unit != null ? toText(payload.unit) : toText(std.unit);
+  const order = payload.display_order != null ? (toNumber(payload.display_order) ?? std.display_order) : std.display_order;
+  const active = payload.is_active != null ? (Number(payload.is_active) ? 1 : 0) : std.is_active;
 
   db.prepare(`
     UPDATE analysis_standards
@@ -1967,7 +2302,7 @@ function updateAnalysisStandard(req, res, body) {
 
   const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(std.version_id);
   addStandardLog(std.version_id, version ? version.version_code : '', 'update', name,
-    `修改标准：原 ${std.standard_value} ± ${std.tolerance} → 新 ${stdValue} ± ${tol} ${u}`, operator);
+    `修改标准：原 ${std.standard_value} ± ${std.tolerance} → 新 ${stdValue} ± ${tol} ${u}`, operatorName(req));
 
   const record = db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(id);
   json(res, { success: true, standard: record });
@@ -1975,14 +2310,17 @@ function updateAnalysisStandard(req, res, body) {
 
 // POST /api/analysis/standards/delete - 删除标准参数
 function deleteAnalysisStandard(req, res, body) {
-  const { id, operator } = body || {};
-  const std = db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(id);
+  const payload = body || {};
+  const id = Number(payload.id);
+  const std = Number.isSafeInteger(id) && id > 0
+    ? db.prepare('SELECT * FROM analysis_standards WHERE id = ?').get(id)
+    : null;
   if (!std) return json(res, { error: '标准参数不存在' }, 404);
 
   db.prepare('DELETE FROM analysis_standards WHERE id = ?').run(id);
   const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(std.version_id);
   addStandardLog(std.version_id, version ? version.version_code : '', 'delete', std.param_name,
-    `删除标准参数 ${std.param_name}（${std.standard_value} ± ${std.tolerance}）`, operator);
+    `删除标准参数 ${std.param_name}（${std.standard_value} ± ${std.tolerance}）`, operatorName(req));
 
   json(res, { success: true });
 }
@@ -1990,11 +2328,16 @@ function deleteAnalysisStandard(req, res, body) {
 // POST /api/analysis/standards/reorder - 批量调整某版本标准参数的显示顺序
 //   body: { version_id, ids: [按新顺序排列的标准 id 数组], operator }
 function reorderAnalysisStandards(req, res, body) {
-  const { version_id, ids, operator } = body || {};
-  const version = db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(version_id);
+  const payload = body || {};
+  const versionId = Number(payload.version_id);
+  const version = Number.isSafeInteger(versionId) && versionId > 0
+    ? db.prepare('SELECT * FROM analysis_standard_versions WHERE id = ?').get(versionId)
+    : null;
   if (!version) return json(res, { error: '标准版本不存在' }, 404);
 
-  const list = Array.isArray(ids) ? ids.map((v) => Number(v)).filter((v) => Number.isFinite(v)) : [];
+  const list = Array.isArray(payload.ids)
+    ? payload.ids.map((v) => Number(v)).filter((v) => Number.isSafeInteger(v) && v > 0)
+    : [];
   if (!list.length) return json(res, { error: '缺少排序参数' }, 400);
 
   const upd = db.prepare(`
@@ -2002,15 +2345,19 @@ function reorderAnalysisStandards(req, res, body) {
     SET display_order = ?, updated_at = datetime('now','localtime')
     WHERE id = ? AND version_id = ?
   `);
+  let updated = 0;
   const tx = db.transaction(() => {
-    list.forEach((id, i) => upd.run(i + 1, id, version_id));
+    list.forEach((id, i) => {
+      updated += upd.run(i + 1, id, versionId).changes;
+    });
   });
   tx();
 
-  addStandardLog(version_id, version.version_code, 'update', '显示顺序',
-    `调整标准参数显示顺序（共 ${list.length} 项）`, operator);
+  addStandardLog(versionId, version.version_code, 'update', '显示顺序',
+    `调整标准参数显示顺序（实际更新 ${updated} 项）`, operatorName(req));
 
-  json(res, { success: true, count: list.length });
+  // 返回实际更新行数，便于前端发现被过滤掉的越权 / 无效 id
+  json(res, { success: true, count: updated, requested: list.length });
 }
 
 // GET /api/analysis/params - 可作为分析标准的工艺参数清单
@@ -2026,6 +2373,598 @@ function getAnalysisStandardLogs(req, res) {
   json(res, logs);
 }
 
+// ==================== 登录 / 会话 / 用户权限 ====================
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function stampNow(offsetMs = 0) {
+  const d = new Date(Date.now() + offsetMs);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
+    + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+// 密码哈希：scrypt（随机盐 + 恒定时间比较）
+// 同步版本仅用于启动建库 / 数据迁移；请求路径一律走异步版本，避免阻塞事件循环
+function hashPasswordSync(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 32).toString('hex');
+  return `scrypt$${salt}$${hash}`;
+}
+
+function scryptAsync(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(password), salt, 32, (err, derived) => {
+      if (err) reject(err);
+      else resolve(derived);
+    });
+  });
+}
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = (await scryptAsync(password, salt)).toString('hex');
+  return `scrypt$${salt}$${hash}`;
+}
+
+async function verifyPassword(password, stored) {
+  const parts = String(stored || '').split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  const [, salt, hash] = parts;
+  try {
+    const calc = await scryptAsync(password, salt);
+    const expect = Buffer.from(hash, 'hex');
+    if (expect.length !== calc.length) return false;
+    return crypto.timingSafeEqual(calc, expect);
+  } catch {
+    return false;
+  }
+}
+
+// 异步处理兜底：路由层不 await，异常必须在此收敛，避免请求悬挂
+function runAsync(res, label, task) {
+  return Promise.resolve()
+    .then(task)
+    .catch((err) => {
+      logWrite('ERROR', `${label}失败: ${err && err.stack ? err.stack : err}`);
+      if (!res.headersSent) {
+        json(res, { error: `${label}失败，请稍后再试` }, 500);
+      } else {
+        try { res.end(); } catch { /* 忽略重复结束 */ }
+      }
+    });
+}
+
+const PASSWORD_MIN_LENGTH = 6;
+const PASSWORD_MAX_LENGTH = 128;
+
+function isValidPasswordLength(password) {
+  return password.length >= PASSWORD_MIN_LENGTH && password.length <= PASSWORD_MAX_LENGTH;
+}
+
+function parseCookies(header) {
+  const out = {};
+  String(header || '').split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx < 0) return;
+    const key = part.slice(0, idx).trim();
+    if (!key) return;
+    try {
+      out[key] = decodeURIComponent(part.slice(idx + 1).trim());
+    } catch {
+      // 畸形编码（如 %、%E0%A4%A）不能抛异常，否则整个请求会悬挂
+      out[key] = '';
+    }
+  });
+  return out;
+}
+
+function sessionCookieHeader(token, maxAgeSec) {
+  // HTTPS 部署（COOKIE_SECURE=1）时追加 Secure，避免会话 Cookie 明文回传
+  const secure = COOKIE_SECURE ? '; Secure' : '';
+  return `${AUTH_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${secure}`;
+}
+
+// 客户端 IP：未显式声明信任反向代理时，只取直连地址，防止伪造 X-Forwarded-For 绕过限流
+function clientIp(req) {
+  const socketIp = (req.socket && req.socket.remoteAddress) || '';
+  if (!TRUST_PROXY) return socketIp;
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || socketIp;
+}
+
+function parseJsonList(value) {
+  try {
+    const arr = JSON.parse(value || '[]');
+    return Array.isArray(arr) ? arr.map((v) => String(v)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function sanitizeAssignments(list, allowed) {
+  if (!Array.isArray(list)) return [];
+  return [...new Set(list.map((v) => String(v)).filter((v) => allowed.includes(v)))];
+}
+
+function isSuperUser(user) {
+  return !!user && user.role === 'super';
+}
+
+// 审计操作人：一律取当前登录用户，禁止前端自由传入伪造
+function operatorName(req, fallback = '系统') {
+  const user = req && req.user;
+  if (user && user.username) return user.username;
+  return fallback;
+}
+
+// 用户管理权限：超管，或拥有「用户权限」页面（含 user 相关动作）的账号
+function isUserManager(row) {
+  if (!row) return false;
+  if (isSuperUser(row)) return true;
+  const pages = parseJsonList(row.admin_pages);
+  const actions = parseJsonList(row.actions);
+  return pages.includes('user') || actions.some((k) => String(k).startsWith('user:'));
+}
+
+// 对外用户信息（不含密码哈希）
+function authPayload(user) {
+  if (!user) return null;
+  const displayPages = isSuperUser(user) ? DISPLAY_PAGE_KEYS.slice() : parseJsonList(user.display_pages);
+  const adminPages = isSuperUser(user) ? ADMIN_PAGE_KEYS.slice() : parseJsonList(user.admin_pages);
+  // 旧数据可能残留「没有对应页面却勾了动作」的组合，读取时同样收敛
+  const effective = pruneActionsByPages({
+    display_pages: displayPages,
+    admin_pages: adminPages,
+    actions: isSuperUser(user)
+      ? ALL_ACTION_KEYS.slice()
+      : parseJsonList(user.actions).filter((k) => ALL_ACTION_KEYS.includes(k)),
+  });
+  return {
+    id: Number(user.id),
+    username: user.username,
+    display_name: user.display_name || user.username,
+    role: user.role,
+    is_super: isSuperUser(user),
+    is_active: Number(user.is_active) === 1 ? 1 : 0,
+    display_pages: displayPages,
+    admin_pages: adminPages,
+    actions: effective.actions,
+    last_login_at: user.last_login_at || '',
+    created_at: user.created_at || '',
+  };
+}
+
+function authMeta() {
+  return {
+    display_pages: DISPLAY_PAGES,
+    admin_pages: ADMIN_PAGES,
+    actions: ACTION_CATALOG,
+    session_hours: SESSION_TTL_HOURS,
+  };
+}
+
+// 按钮级权限：超级管理员拥有全部动作；普通用户必须先拥有该模块页面，动作才生效
+function userCanAction(user, module, action) {
+  if (!user) return false;
+  if (isSuperUser(user)) return true;
+  const owned = new Set([...parseJsonList(user.display_pages), ...parseJsonList(user.admin_pages)]);
+  if (!owned.has(module)) return false;
+  return parseJsonList(user.actions).includes(`${module}:${action}`);
+}
+
+// 页面级读权限：用户拥有的看板 / 后台页面任一命中即可
+function userCanRead(user, modules) {
+  if (!user) return false;
+  if (isSuperUser(user)) return true;
+  if (!Array.isArray(modules) || !modules.length) return true;
+  const owned = new Set([...parseJsonList(user.display_pages), ...parseJsonList(user.admin_pages)]);
+  return modules.some((m) => owned.has(m));
+}
+
+function findWritePermission(pathname) {
+  return WRITE_API_PERMISSIONS.find((item) => item.pattern.test(pathname)) || null;
+}
+
+function findReadModules(pathname) {
+  const hit = READ_API_MODULES.find((item) => pathname === item.prefix || pathname.startsWith(`${item.prefix}/`));
+  return hit ? hit.modules : null;
+}
+
+function getSessionUser(req) {
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE];
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
+  const row = db.prepare(`
+    SELECT u.*, s.token AS session_token, s.expires_at AS session_expires
+    FROM user_sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.token = ?
+  `).get(token);
+  if (!row) return null;
+  if (String(row.session_expires || '') <= stampNow()) {
+    db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token);
+    return null;
+  }
+  if (Number(row.is_active) !== 1) return null;
+  // 滑动续期：剩余不足 1/3 时顺延，避免每个请求都写库
+  const expiresAt = new Date(String(row.session_expires).replace(' ', 'T')).getTime();
+  if (Number.isFinite(expiresAt) && expiresAt - Date.now() < (SESSION_TTL_HOURS * 3600 * 1000) / 3) {
+    db.prepare('UPDATE user_sessions SET expires_at = ? WHERE token = ?')
+      .run(stampNow(SESSION_TTL_HOURS * 3600 * 1000), token);
+  }
+  return row;
+}
+
+// 统一解析身份：会话 Cookie 优先；配置了 ADMIN_TOKEN 时允许脚本携带机器令牌（等同超级管理员）
+function resolveAuth(req) {
+  const user = getSessionUser(req);
+  if (user) return { user, source: 'session' };
+  if (ADMIN_TOKEN && String(req.headers['x-admin-token'] || '') === ADMIN_TOKEN) {
+    return { user: { id: 0, username: 'system', display_name: '系统任务', role: 'super', is_active: 1 }, source: 'token' };
+  }
+  return { user: null, source: 'none' };
+}
+
+function createSession(userId, req) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expires = stampNow(SESSION_TTL_HOURS * 3600 * 1000);
+  db.prepare(`
+    INSERT INTO user_sessions (token, user_id, created_at, expires_at, last_seen, ip, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(token, userId, stampNow(), expires, stampNow(), clientIp(req),
+    String(req.headers['user-agent'] || '').slice(0, 200));
+  return token;
+}
+
+function destroySession(token) {
+  if (!token) return;
+  db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token);
+}
+
+// 同源校验：携带会话 Cookie 的写请求若带 Origin，必须与 Host 一致（防 CSRF）
+// 缺少 Origin 时退化为 Referer 校验；两者都没有则视为非浏览器客户端，交由会话与权限校验
+function sameOriginRequest(req) {
+  const host = String(req.headers.host || '');
+  const origin = String(req.headers.origin || '').trim();
+  if (origin) {
+    try {
+      return new URL(origin).host === host;
+    } catch {
+      return false;
+    }
+  }
+  const referer = String(req.headers.referer || '').trim();
+  if (referer) {
+    try {
+      return new URL(referer).host === host;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function loginFailureState(key) {
+  const state = loginFailures.get(key);
+  if (!state) return null;
+  if (state.until && state.until > Date.now()) return { locked: true, seconds: Math.ceil((state.until - Date.now()) / 1000) };
+  if (!state.until) return null;
+  loginFailures.delete(key);
+  return null;
+}
+
+function recordLoginFailure(key) {
+  const state = loginFailures.get(key) || { count: 0, until: 0 };
+  state.count += 1;
+  if (state.count >= LOGIN_MAX_FAILS) {
+    state.until = Date.now() + LOGIN_LOCK_SECONDS * 1000;
+    state.count = 0;
+    logWrite('WARN', `登录失败次数过多，锁定 ${LOGIN_LOCK_SECONDS} 秒：${key}`);
+  }
+  loginFailures.set(key, state);
+  if (loginFailures.size > 5000) {
+    // 简单清理，避免长期运行后 Map 无限增长
+    const now = Date.now();
+    for (const [k, v] of loginFailures) {
+      if (!v.until || v.until < now) loginFailures.delete(k);
+    }
+  }
+}
+
+// POST /api/auth/login - 账号密码登录（HttpOnly Cookie 会话）
+// 包装层负责并发闸门与异常兜底，实际校验走异步 scrypt，避免阻塞事件循环
+function login(req, res, body) {
+  if (loginInFlight >= LOGIN_MAX_CONCURRENT) {
+    return json(res, { error: '登录请求过多，请稍后再试' }, 429);
+  }
+  loginInFlight += 1;
+  runAsync(res, '登录', () => loginTask(req, res, body))
+    .finally(() => { loginInFlight -= 1; });
+}
+
+async function loginTask(req, res, body) {
+  const username = toText(body && body.username);
+  const password = typeof (body && body.password) === 'string' ? body.password : '';
+  if (!username || !password) return json(res, { error: '请输入用户名和密码' }, 400);
+  // 超长密码直接拒绝，避免把超大输入交给哈希函数
+  if (password.length > PASSWORD_MAX_LENGTH) return json(res, { error: '用户名或密码错误' }, 401);
+
+  const key = `${clientIp(req)}|${username.toLowerCase()}`;
+  const locked = loginFailureState(key);
+  if (locked && locked.locked) {
+    return json(res, { error: `登录失败次数过多，请 ${locked.seconds} 秒后再试` }, 429);
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(username);
+  const ok = !!user && Number(user.is_active) === 1 && await verifyPassword(password, user.password_hash);
+  if (!ok) {
+    recordLoginFailure(key);
+    logWrite('WARN', `登录失败：${username} from ${clientIp(req)}`);
+    return json(res, { error: '用户名或密码错误' }, 401);
+  }
+
+  loginFailures.delete(key);
+  const token = createSession(user.id, req);
+  db.prepare("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
+    .run(stampNow(), stampNow(), user.id);
+  res.setHeader('Set-Cookie', sessionCookieHeader(token, SESSION_TTL_HOURS * 3600));
+  logWrite('AUTH', `用户登录：${user.username}`);
+  json(res, { success: true, user: authPayload({ ...user, last_login_at: stampNow() }), meta: authMeta() });
+}
+
+// POST /api/auth/logout - 退出登录
+function logout(req, res) {
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE];
+  destroySession(token);
+  res.setHeader('Set-Cookie', sessionCookieHeader('', 0));
+  json(res, { success: true });
+}
+
+// GET /api/auth/me - 当前登录用户（未登录返回 user: null，供前端判断是否展示登录按钮）
+function getAuthMe(req, res) {
+  const { user } = resolveAuth(req);
+  json(res, { user: authPayload(user), meta: authMeta() });
+}
+
+// POST /api/auth/password - 修改自己的密码
+function changeOwnPassword(req, res, body, user) {
+  runAsync(res, '修改密码', () => changeOwnPasswordTask(req, res, body, user));
+}
+
+async function changeOwnPasswordTask(req, res, body, user) {
+  const oldPassword = typeof (body && body.old_password) === 'string' ? body.old_password : '';
+  const newPassword = typeof (body && body.new_password) === 'string' ? body.new_password : '';
+  if (!oldPassword || !newPassword) return json(res, { error: '请填写原密码与新密码' }, 400);
+  if (!isValidPasswordLength(newPassword)) {
+    return json(res, { error: `新密码长度需在 ${PASSWORD_MIN_LENGTH} ~ ${PASSWORD_MAX_LENGTH} 位之间` }, 400);
+  }
+  if (newPassword === oldPassword) return json(res, { error: '新密码不能与原密码相同' }, 400);
+
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  if (!row || !(await verifyPassword(oldPassword, row.password_hash))) {
+    return json(res, { error: '原密码不正确' }, 400);
+  }
+  const passwordHash = await hashPassword(newPassword);
+  db.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+    .run(passwordHash, stampNow(), user.id);
+
+  // 保留当前会话，踢掉该账号其它会话
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE];
+  db.prepare('DELETE FROM user_sessions WHERE user_id = ? AND token <> ?').run(user.id, token || '');
+  logWrite('AUTH', `用户修改密码：${row.username}`);
+  json(res, { success: true });
+}
+
+// GET /api/auth/users - 用户列表（仅用户权限模块可见）
+function getUsers(req, res) {
+  const rows = db.prepare(`
+    SELECT id, username, display_name, role, display_pages, admin_pages, actions,
+           is_active, last_login_at, created_at, updated_at
+    FROM users ORDER BY role = 'super' DESC, id ASC
+  `).all();
+  json(res, {
+    users: rows.map((r) => ({ ...authPayload(r), is_active: Number(r.is_active) })),
+    total: rows.length,
+  });
+}
+
+function normalizeUserAssignments(payload) {
+  return {
+    display_pages: sanitizeAssignments(payload.display_pages, DISPLAY_PAGE_KEYS),
+    admin_pages: sanitizeAssignments(payload.admin_pages, ADMIN_PAGE_KEYS),
+    actions: sanitizeAssignments(payload.actions, ALL_ACTION_KEYS),
+  };
+}
+
+// 动作权限必须依附于所属模块页面：没有分配该模块（看板或后台任一端）时，其下的按钮动作不生效
+function pruneActionsByPages(assign) {
+  const modules = new Set([...(assign.display_pages || []), ...(assign.admin_pages || [])]);
+  return {
+    display_pages: assign.display_pages || [],
+    admin_pages: assign.admin_pages || [],
+    actions: (assign.actions || []).filter((key) => modules.has(String(key).split(':')[0])),
+  };
+}
+
+// 非超级管理员不得授予超管角色 / 用户权限页面 / 用户管理动作，防止越权提权
+function clampAssignmentsForOperator(assign, role, operator) {
+  if (isSuperUser(operator)) return { assign, role };
+  return {
+    role: 'normal',
+    assign: {
+      display_pages: assign.display_pages,
+      admin_pages: assign.admin_pages.filter((k) => k !== 'user'),
+      actions: assign.actions.filter((k) => !k.startsWith('user:')),
+    },
+  };
+}
+
+function activeSuperCount(excludeId = 0) {
+  return db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'super' AND is_active = 1 AND id <> ?")
+    .get(excludeId).c;
+}
+
+// POST /api/auth/users/create - 新增用户
+function createUser(req, res, body, operator) {
+  runAsync(res, '新增用户', () => createUserTask(req, res, body, operator));
+}
+
+async function createUserTask(req, res, body, operator) {
+  const username = toText(body && body.username);
+  const displayName = toText(body && body.display_name) || username;
+  const password = typeof (body && body.password) === 'string' ? body.password : '';
+  let role = body && body.role === 'super' ? 'super' : 'normal';
+  if (!username) return json(res, { error: '缺少用户名' }, 400);
+  if (!/^[A-Za-z0-9_.-]{3,32}$/.test(username)) {
+    return json(res, { error: '用户名只能包含字母、数字、下划线、点和短横线，长度 3-32' }, 400);
+  }
+  // 不再回落到全局默认密码：新建账号必须显式设置初始密码
+  if (!password) return json(res, { error: '请设置初始密码' }, 400);
+  if (!isValidPasswordLength(password)) {
+    return json(res, { error: `密码长度需在 ${PASSWORD_MIN_LENGTH} ~ ${PASSWORD_MAX_LENGTH} 位之间` }, 400);
+  }
+  if (db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(username)) {
+    return json(res, { error: `用户名 ${username} 已存在` }, 400);
+  }
+
+  let assign = normalizeUserAssignments(body || {});
+  ({ assign, role } = clampAssignmentsForOperator(assign, role, operator));
+  // 未分配的模块不保留其下动作，避免出现「无页面却有按钮权限」的悬空授权
+  assign = pruneActionsByPages(assign);
+  const passwordHash = await hashPassword(password);
+  const info = db.prepare(`
+    INSERT INTO users (username, display_name, password_hash, role, display_pages, admin_pages, actions, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    username, displayName, passwordHash, role,
+    JSON.stringify(assign.display_pages), JSON.stringify(assign.admin_pages), JSON.stringify(assign.actions),
+    body && body.is_active != null ? (Number(body.is_active) ? 1 : 0) : 1
+  );
+
+  addStandardLogSafe('AUTH', `新增用户 ${username}`, operatorName(req));
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+  json(res, { success: true, user: authPayload(row) });
+}
+
+// POST /api/auth/users/update - 修改用户（含密码重置、页面与动作授权）
+function updateUser(req, res, body, operator) {
+  runAsync(res, '修改用户', () => updateUserTask(req, res, body, operator));
+}
+
+async function updateUserTask(req, res, body, operator) {
+  const id = Number(body && body.id);
+  const row = Number.isSafeInteger(id) && id > 0 ? db.prepare('SELECT * FROM users WHERE id = ?').get(id) : null;
+  if (!row) return json(res, { error: '用户不存在' }, 404);
+
+  // 非超级管理员不得修改超级管理员账号
+  if (isSuperUser(row) && !isSuperUser(operator)) {
+    return json(res, { error: '只有超级管理员可以修改超级管理员账号' }, 403);
+  }
+  // 非超管同样不得修改其他管理员账号（防止同级相互重置密码接管）
+  if (!isSuperUser(operator) && isUserManager(row) && Number(operator && operator.id) !== id) {
+    return json(res, { error: '无权修改其他管理员账号' }, 403);
+  }
+
+  const isSelf = operator && Number(operator.id) === id;
+  let nextRole = body && body.role === 'super' ? 'super' : (body && body.role === 'normal' ? 'normal' : row.role);
+  const nextActive = body && body.is_active != null ? (Number(body.is_active) ? 1 : 0) : Number(row.is_active);
+
+  if (row.role === 'super' && (nextRole !== 'super' || nextActive !== 1) && activeSuperCount(id) === 0) {
+    return json(res, { error: '至少保留一个启用的超级管理员' }, 400);
+  }
+  if (isSelf && (nextRole !== 'super' || nextActive !== 1)) {
+    return json(res, { error: '不能降级或停用当前登录账号' }, 400);
+  }
+
+  const username = body && body.username != null ? toText(body.username) : row.username;
+  if (!/^[A-Za-z0-9_.-]{3,32}$/.test(username)) {
+    return json(res, { error: '用户名只能包含字母、数字、下划线、点和短横线，长度 3-32' }, 400);
+  }
+  const dup = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id <> ?').get(username, id);
+  if (dup) return json(res, { error: `用户名 ${username} 已存在` }, 400);
+
+  let assign = body && (body.display_pages !== undefined || body.admin_pages !== undefined || body.actions !== undefined)
+    ? normalizeUserAssignments({
+      display_pages: body.display_pages !== undefined ? body.display_pages : parseJsonList(row.display_pages),
+      admin_pages: body.admin_pages !== undefined ? body.admin_pages : parseJsonList(row.admin_pages),
+      actions: body.actions !== undefined ? body.actions : parseJsonList(row.actions),
+    })
+    : {
+      display_pages: parseJsonList(row.display_pages),
+      admin_pages: parseJsonList(row.admin_pages),
+      actions: parseJsonList(row.actions),
+    };
+  ({ assign, role: nextRole } = clampAssignmentsForOperator(assign, nextRole, operator));
+  // 取消某模块页面时，同步回收其下的按钮动作
+  assign = pruneActionsByPages(assign);
+
+  let passwordHash = row.password_hash;
+  if (typeof (body && body.password) === 'string' && body.password) {
+    if (!isValidPasswordLength(body.password)) {
+      return json(res, { error: `密码长度需在 ${PASSWORD_MIN_LENGTH} ~ ${PASSWORD_MAX_LENGTH} 位之间` }, 400);
+    }
+    passwordHash = await hashPassword(body.password);
+  }
+
+  db.prepare(`
+    UPDATE users
+    SET username = ?, display_name = ?, password_hash = ?, role = ?,
+        display_pages = ?, admin_pages = ?, actions = ?, is_active = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    username,
+    body && body.display_name != null ? toText(body.display_name) : (row.display_name || row.username),
+    passwordHash, nextRole,
+    JSON.stringify(assign.display_pages), JSON.stringify(assign.admin_pages), JSON.stringify(assign.actions),
+    nextActive, stampNow(), id
+  );
+
+  // 停用或改密后，清理该用户的其它会话，避免旧会话继续可用
+  if (nextActive !== 1 || passwordHash !== row.password_hash) {
+    db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(id);
+  }
+
+  addStandardLogSafe('AUTH', `修改用户 ${username}`, operatorName(req));
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  json(res, { success: true, user: authPayload(updated) });
+}
+
+// POST /api/auth/users/delete - 删除用户
+function deleteUser(req, res, body, operator) {
+  const id = Number(body && body.id);
+  const row = Number.isSafeInteger(id) && id > 0 ? db.prepare('SELECT * FROM users WHERE id = ?').get(id) : null;
+  if (!row) return json(res, { error: '用户不存在' }, 404);
+  if (operator && Number(operator.id) === id) return json(res, { error: '不能删除当前登录账号' }, 400);
+  if (row.role === 'super' && !isSuperUser(operator)) {
+    return json(res, { error: '只有超级管理员可以删除超级管理员账号' }, 403);
+  }
+  // 非超管不得删除其他管理员账号（含拥有用户管理权限的普通账号）
+  if (!isSuperUser(operator) && isUserManager(row)) {
+    return json(res, { error: '无权删除管理员账号' }, 403);
+  }
+  if (row.role === 'super' && activeSuperCount(id) === 0) {
+    return json(res, { error: '至少保留一个启用的超级管理员' }, 400);
+  }
+
+  db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  addStandardLogSafe('AUTH', `删除用户 ${row.username}`, operatorName(req));
+  json(res, { success: true });
+}
+
+// 审计日志：写入系统日志表（兼容未初始化日志表的环境）
+// operator 由调用方传入登录用户名，避免审计主体被请求体伪造
+function addStandardLogSafe(action, content, operator = 'system') {
+  try {
+    if (!tableExists('analysis_standard_logs')) return;
+    db.prepare(`
+      INSERT INTO analysis_standard_logs (version_id, version_code, action, target, content, operator)
+      VALUES (NULL, '', ?, '', ?, ?)
+    `).run(action, content, String(operator || 'system').slice(0, 64));
+  } catch {
+    // 审计失败不影响主流程
+  }
+}
+
 // ==================== HTTP 服务器 ====================
 // 跨域头：仅在配置 CORS_ORIGIN 白名单后下发，默认同源部署不开放跨域
 function corsHeaders(origin) {
@@ -2037,15 +2976,45 @@ function corsHeaders(origin) {
   return {};
 }
 
-// 写接口令牌校验：未配置 ADMIN_TOKEN 时不启用（兼容内网单机部署）
-function isAuthorized(req, pathname) {
-  if (!ADMIN_TOKEN) return true;
-  if (req.method !== 'POST') return true;
+// 接口鉴权：公开接口放行；其余要求登录，写接口再校验按钮动作权限
+function guardApiRequest(req, res, pathname) {
   if (!pathname.startsWith('/api/')) return true;
-  return String(req.headers['x-admin-token'] || '') === ADMIN_TOKEN;
+  if (PUBLIC_API_PATHS.has(pathname)) return true;
+
+  const auth = resolveAuth(req);
+  req.user = auth.user;
+  req.authSource = auth.source;
+
+  if (!auth.user) {
+    json(res, { error: '请先登录' }, 401);
+    return false;
+  }
+  // 基于 Cookie 的写请求做同源校验，降低 CSRF 风险（机器令牌不受限）
+  if (req.method === 'POST' && auth.source === 'session' && !sameOriginRequest(req)) {
+    json(res, { error: '跨站请求被拒绝' }, 403);
+    return false;
+  }
+  if (req.method === 'POST') {
+    const perm = findWritePermission(pathname);
+    if (perm && !userCanAction(auth.user, perm.module, perm.action)) {
+      json(res, { error: `无操作权限（${perm.module}:${perm.action}）` }, 403);
+      return false;
+    }
+    return true;
+  }
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    const modules = findReadModules(pathname);
+    if (modules && !userCanRead(auth.user, modules)) {
+      json(res, { error: '无权访问该模块数据' }, 403);
+      return false;
+    }
+  }
+  return true;
 }
 
-const server = http.createServer((req, res) => {
+// 请求入口：解析 URL 与鉴权。整段由 createServer 外层 try/catch 兜底，
+// 避免畸形 URL / Cookie 等输入抛异常后请求悬挂（全局 uncaughtException 不会自动响应）
+function handleIncoming(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const pathname = url.pathname;
 
@@ -2068,26 +3037,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 写接口令牌校验
-  if (!isAuthorized(req, pathname)) {
-    json(res, { error: '未授权：缺少或错误的 X-Admin-Token' }, 401);
-    return;
-  }
+  // 登录与权限校验（公开接口：健康检查 / 登录 / 会话查询 / 看板首页数据）
+  if (!guardApiRequest(req, res, pathname)) return;
 
   // POST 请求体解析（限制大小，防止超大 body 耗尽内存）
   if (req.method === 'POST') {
-    let body = '';
+    const chunks = [];
+    let size = 0;
     let aborted = false;
     req.on('data', (chunk) => {
       if (aborted) return;
-      body += chunk;
-      if (Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES) {
+      size += chunk.length; // 按字节累加，避免每块都全量计算字符串长度
+      if (size > MAX_BODY_BYTES) {
         aborted = true;
         json(res, { error: `请求体超过 ${MAX_BODY_BYTES} 字节上限` }, 413);
+        return;
       }
+      chunks.push(chunk);
+    });
+    req.on('error', () => {
+      aborted = true;
+    });
+    req.on('aborted', () => {
+      aborted = true;
     });
     req.on('end', () => {
       if (aborted) return;
+      const body = Buffer.concat(chunks).toString('utf8');
       let parsed;
       try {
         parsed = JSON.parse(body || '{}');
@@ -2105,6 +3081,52 @@ const server = http.createServer((req, res) => {
   }
 
   handleRoute(req, res, pathname, null);
+}
+
+const server = http.createServer((req, res) => {
+  try {
+    handleIncoming(req, res);
+  } catch (err) {
+    logWrite('ERROR', `${req.method} ${req.url} 请求入口异常: ${err && err.stack ? err.stack : err}`);
+    if (!res.headersSent) {
+      json(res, { error: '服务器内部错误，请联系管理员查看服务日志' }, 500);
+    } else {
+      try { res.end(); } catch { /* 忽略重复结束 */ }
+    }
+  }
+});
+
+// 连接级超时：避免慢速请求长期占用连接（slowloris）
+server.headersTimeout = 20000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+
+server.on('clientError', (err, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+server.on('error', (err) => {
+  logWrite('ERROR', `服务启动失败: ${err && err.message ? err.message : err}`);
+  process.exit(1);
+});
+
+// 优雅退出：停止接收新连接并关闭数据库（触发 WAL checkpoint）
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logWrite('SYSTEM', `收到 ${signal}，开始优雅退出`);
+  const finish = () => {
+    try { db.close(); } catch { /* 忽略关闭异常 */ }
+    process.exit(0);
+  };
+  server.close(finish);
+  const timer = setTimeout(finish, 5000);
+  if (timer.unref) timer.unref();
+}
+
+['SIGINT', 'SIGTERM'].forEach((signal) => {
+  process.on(signal, () => shutdown(signal));
 });
 
 // 路由异常兜底：业务异常返回 500，进程不中断
@@ -2123,6 +3145,41 @@ function handleRoute(req, res, pathname, body) {
   }
 }
 
+// 只读接口 / 只写接口清单：用于对「方法不匹配」返回 405，而不是落到静态兜底
+const API_GET_ONLY = new Set([
+  '/health',
+  '/api/devices/overview', '/api/devices/alarm-log', '/api/devices/list', '/api/devices/options',
+  '/api/products/list', '/api/products/options',
+  '/api/thermal/config', '/api/thermal/latest',
+  '/api/molds/list', '/api/molds/options',
+  '/api/recipes', '/api/recipes/list', '/api/recipes/export', '/api/recipes/options',
+  '/api/pipeline',
+  '/api/andon/types', '/api/andon/calls', '/api/andon/logs',
+  '/api/process/data', '/api/process/filters', '/api/process/params', '/api/process/chart', '/api/process/export',
+  '/api/analysis/data', '/api/analysis/filters', '/api/analysis/standards', '/api/analysis/params',
+  '/api/analysis/standard-logs', '/api/analysis/versions',
+  '/api/stats/list', '/api/stats/export', '/api/stats/shifts',
+  '/api/plans/list', '/api/plans/export', '/api/plans/options', '/api/plans/logs', '/api/plans/records',
+  '/api/auth/me', '/api/auth/meta', '/api/auth/users',
+]);
+
+const API_POST_ONLY = new Set([
+  '/api/auth/login', '/api/auth/logout', '/api/auth/password',
+  '/api/auth/users/create', '/api/auth/users/update', '/api/auth/users/delete',
+  '/api/devices/create', '/api/devices/update', '/api/devices/delete',
+  '/api/products/create', '/api/products/update', '/api/products/delete',
+  '/api/molds/create', '/api/molds/update', '/api/molds/delete',
+  '/api/recipes/create', '/api/recipes/update', '/api/recipes/delete',
+  '/api/pipeline/update',
+  '/api/andon/call', '/api/andon/respond', '/api/andon/complete',
+  '/api/analysis/versions/create', '/api/analysis/versions/update', '/api/analysis/versions/delete',
+  '/api/analysis/standards/create', '/api/analysis/standards/update', '/api/analysis/standards/delete',
+  '/api/analysis/standards/reorder',
+  '/api/stats/shifts/create', '/api/stats/shifts/update', '/api/stats/shifts/delete',
+  '/api/stats/shifts/init', '/api/stats/rebuild',
+  '/api/plans/create', '/api/plans/update', '/api/plans/status', '/api/plans/delete',
+]);
+
 function routeRequest(req, res, pathname, body) {
   // 仅 API 路由记录请求日志
   if (pathname.startsWith('/api/')) {
@@ -2131,6 +3188,27 @@ function routeRequest(req, res, pathname, body) {
 
   // 健康检查（探活监控）
   if (pathname === '/health') return healthCheck(req, res);
+
+  // 方法不匹配：明确返回 405，避免被静态兜底伪装成 200 HTML
+  if (API_POST_ONLY.has(pathname) && req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return json(res, { error: `${pathname} 仅支持 POST 请求` }, 405);
+  }
+  if (API_GET_ONLY.has(pathname) && req.method !== 'GET' && req.method !== 'HEAD') {
+    res.setHeader('Allow', 'GET, HEAD');
+    return json(res, { error: `${pathname} 仅支持 GET 请求` }, 405);
+  }
+
+  // 登录 / 会话 / 用户权限
+  if (pathname === '/api/auth/login') return login(req, res, body);
+  if (pathname === '/api/auth/logout') return logout(req, res);
+  if (pathname === '/api/auth/me') return getAuthMe(req, res);
+  if (pathname === '/api/auth/meta') return json(res, authMeta());
+  if (pathname === '/api/auth/password' && req.method === 'POST') return changeOwnPassword(req, res, body, req.user || { id: 0 });
+  if (pathname === '/api/auth/users') return getUsers(req, res);
+  if (pathname === '/api/auth/users/create' && req.method === 'POST') return createUser(req, res, body, req.user);
+  if (pathname === '/api/auth/users/update' && req.method === 'POST') return updateUser(req, res, body, req.user);
+  if (pathname === '/api/auth/users/delete' && req.method === 'POST') return deleteUser(req, res, body, req.user);
 
   // API 路由
   if (pathname === '/api/devices/overview') return getDeviceOverview(req, res);
@@ -2218,10 +3296,17 @@ function routeRequest(req, res, pathname, body) {
   if (pathname === '/api/plans/list') return getPlans(req, res);
   if (pathname === '/api/plans/export') return exportPlans(req, res);
   if (pathname === '/api/plans/options') return getPlanOptions(req, res);
+  if (pathname === '/api/plans/logs') return getPlanLogs(req, res);
+  if (pathname === '/api/plans/records') return getPlanRecords(req, res);
   if (pathname === '/api/plans/create' && req.method === 'POST') return createPlan(req, res, body);
   if (pathname === '/api/plans/update' && req.method === 'POST') return updatePlan(req, res, body);
   if (pathname === '/api/plans/status' && req.method === 'POST') return updatePlanStatus(req, res, body);
   if (pathname === '/api/plans/delete' && req.method === 'POST') return deletePlan(req, res, body);
+
+  // 未注册的 API 路径统一 404 JSON（不再回退到 index.html）
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    return json(res, { error: `接口不存在：${pathname}` }, 404);
+  }
 
   // 静态文件
   serveStatic(req, res);
@@ -2243,8 +3328,10 @@ function formatDateStr(d) {
 function parseDateStr(value) {
   const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(value || '').trim());
   if (!m) return null;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return Number.isNaN(d.getTime()) ? null : d;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  // 严格日历校验：2026-02-31 这类会被 Date 自动进位的日期视为非法
+  if (!isValidDateParts(year, month, day)) return null;
+  return new Date(year, month - 1, day);
 }
 
 function addDays(dateStr, n) {
@@ -2294,33 +3381,69 @@ function resolveShiftBucket(shifts, collectTime) {
   return { date: datePart, code: 'UNASSIGNED', name: '未分班' };
 }
 
+// 把单条工艺记录累加到「日期 × 班次 × 设备」聚合项
+function addStatRow(map, row, shifts) {
+  const bucket = resolveShiftBucket(shifts, row.collect_time);
+  const key = `${bucket.date}|${bucket.code}|${row.device_code}`;
+  let item = map.get(key);
+  if (!item) {
+    item = {
+      stat_date: bucket.date,
+      shift_code: bucket.code,
+      shift_name: bucket.name,
+      device_code: row.device_code,
+      total_count: 0,
+      qualified_count: 0,
+      warning_count: 0,
+      unqualified_count: 0,
+    };
+    map.set(key, item);
+  }
+  item.total_count += 1;
+  if (row.data_status === 'normal') item.qualified_count += 1;
+  else if (row.data_status === 'warning') item.warning_count += 1;
+  else item.unqualified_count += 1;
+  return item;
+}
+
 // 把 process_data 记录聚合为「日期 × 班次 × 设备」统计行
 // 统计行完全由工艺数据派生：没有来源记录的日期/班次/设备不生成行
 function aggregateStats(rows, shifts) {
   const map = new Map();
-  rows.forEach((row) => {
-    const bucket = resolveShiftBucket(shifts, row.collect_time);
-    const key = `${bucket.date}|${bucket.code}|${row.device_code}`;
-    let item = map.get(key);
-    if (!item) {
-      item = {
-        stat_date: bucket.date,
-        shift_code: bucket.code,
-        shift_name: bucket.name,
-        device_code: row.device_code,
-        total_count: 0,
-        qualified_count: 0,
-        warning_count: 0,
-        unqualified_count: 0,
-      };
-      map.set(key, item);
-    }
-    item.total_count += 1;
-    if (row.data_status === 'normal') item.qualified_count += 1;
-    else if (row.data_status === 'warning') item.warning_count += 1;
-    else item.unqualified_count += 1;
-  });
+  rows.forEach((row) => addStatRow(map, row, shifts));
   return map;
+}
+
+// 按「日」分批查询并聚合：峰值内存只与单日记录数相关，避免大区间一次性读入
+function aggregateDates(dates) {
+  const shifts = activeShifts();
+  const active = activeDeviceCodeSet();
+  const statsMap = new Map();
+  const inactive = new Set();
+  let picked = 0;
+  let skipped = 0;
+  const stmt = db.prepare(`
+    SELECT collect_time, device_code, data_status
+    FROM process_data
+    WHERE collect_time >= ? AND collect_time <= ?
+  `);
+
+  for (const day of dates) {
+    // 多取前后各一天覆盖跨天班次，再按归属日期过滤，避免相邻批次重复计数
+    const rows = stmt.all(`${addDays(day, -1)} 00:00:00`, `${addDays(day, 1)} 23:59:59`);
+    for (const row of rows) {
+      if (resolveShiftBucket(shifts, row.collect_time).date !== day) continue;
+      if (active && !active.has(row.device_code)) {
+        skipped += 1;
+        inactive.add(row.device_code);
+        continue;
+      }
+      picked += 1;
+      addStatRow(statsMap, row, shifts);
+    }
+  }
+
+  return { shifts, statsMap, picked, skipped, inactiveDevices: [...inactive].sort() };
 }
 
 function insertStats(statsMap) {
@@ -2384,20 +3507,8 @@ function calcProductionStats(startDate, endDate) {
   if (!dates.length) throw new Error('日期范围不合法');
   if (dates.length >= 400) throw new Error('单次统计范围不能超过 400 天');
 
-  const shifts = activeShifts();
-
-  // 多取前后各一天，覆盖跨天班次
-  const rows = db.prepare(`
-    SELECT collect_time, device_code, data_status
-    FROM process_data
-    WHERE collect_time >= ? AND collect_time <= ?
-  `).all(`${addDays(start, -1)} 00:00:00`, `${addDays(end, 1)} 23:59:59`);
-
-  // 只保留归属日期落在区间内、且设备处于启用状态的记录
-  const dateSet = new Set(dates);
-  const inRange = rows.filter(row => dateSet.has(resolveShiftBucket(shifts, row.collect_time).date));
-  const { picked, skipped, inactiveDevices } = filterActiveDevices(inRange);
-  const statsMap = aggregateStats(picked, shifts);
+  // 按日分批聚合：峰值内存只与单日记录数相关，避免大区间一次性读入
+  const { shifts, statsMap, picked, skipped, inactiveDevices } = aggregateDates(dates);
 
   const del = db.prepare('DELETE FROM production_stats WHERE stat_date BETWEEN ? AND ?');
   const tx = db.transaction(() => {
@@ -2409,22 +3520,28 @@ function calcProductionStats(startDate, endDate) {
   return {
     startDate: start,
     endDate: end,
-    ...statsSummary(statsMap, shifts, picked.length),
+    ...statsSummary(statsMap, shifts, picked),
     skippedRecords: skipped,
     inactiveDevices,
   };
 }
 
 // 全量重建：清空统计表，按 process_data 现有全部记录重新聚合
+// 先取数据日期范围，再按日分批聚合，避免把全库工艺记录一次性读入内存
 function rebuildAllProductionStats() {
-  const shifts = activeShifts();
-  const rows = db.prepare(`
-    SELECT collect_time, device_code, data_status FROM process_data
-  `).all();
+  const range = db.prepare(`
+    SELECT MIN(substr(collect_time, 1, 10)) AS start_date,
+           MAX(substr(collect_time, 1, 10)) AS end_date
+    FROM process_data
+  `).get();
+  const dates = range && range.start_date && range.end_date
+    ? listDates(range.start_date, range.end_date, 10000)
+    : [];
 
-  // 未启用设备的工艺记录不参与统计
-  const { picked, skipped, inactiveDevices } = filterActiveDevices(rows);
-  const statsMap = aggregateStats(picked, shifts);
+  const aggregated = dates.length
+    ? aggregateDates(dates)
+    : { shifts: activeShifts(), statsMap: new Map(), picked: 0, skipped: 0, inactiveDevices: [] };
+  const { shifts, statsMap, picked, skipped, inactiveDevices } = aggregated;
 
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM production_stats').run();
@@ -2432,15 +3549,15 @@ function rebuildAllProductionStats() {
   });
   tx();
 
-  const summary = statsSummary(statsMap, shifts, picked.length, {
+  const summary = statsSummary(statsMap, shifts, picked, {
     all: true,
     skippedRecords: skipped,
     inactiveDevices,
   });
-  const dates = [...new Set([...statsMap.values()].map(i => i.stat_date))].sort();
+  const statDates = [...new Set([...statsMap.values()].map(i => i.stat_date))].sort();
   return {
-    startDate: dates[0] || '',
-    endDate: dates[dates.length - 1] || '',
+    startDate: statDates[0] || '',
+    endDate: statDates[statDates.length - 1] || '',
     ...summary,
   };
 }
@@ -2449,8 +3566,13 @@ function rebuildAllProductionStats() {
 function getProductionStats(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const today = formatDateStr(new Date());
-  const startDate = url.searchParams.get('startDate') || addDays(today, -6);
-  const endDate = url.searchParams.get('endDate') || today;
+  const rawStart = (url.searchParams.get('startDate') || '').trim();
+  const rawEnd = (url.searchParams.get('endDate') || '').trim();
+  if (rawStart && !parseDateStr(rawStart)) return json(res, { error: '开始日期格式应为 YYYY-MM-DD' }, 400);
+  if (rawEnd && !parseDateStr(rawEnd)) return json(res, { error: '结束日期格式应为 YYYY-MM-DD' }, 400);
+  const startDate = rawStart ? formatDateStr(parseDateStr(rawStart)) : addDays(today, -6);
+  const endDate = rawEnd ? formatDateStr(parseDateStr(rawEnd)) : today;
+  if (startDate > endDate) return json(res, { error: '开始日期不能晚于结束日期' }, 400);
   const device = url.searchParams.get('device') || '';
   const shift = url.searchParams.get('shift');
   const { page, pageSize } = parsePaging(url, 20);
@@ -2513,8 +3635,13 @@ function getProductionStats(req, res) {
 function exportProductionStats(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const win = exportDateWindow();
-  const startDate = url.searchParams.get('startDate') || win.startDate;
-  const endDate = url.searchParams.get('endDate') || win.endDate;
+  const rawStart = (url.searchParams.get('startDate') || '').trim();
+  const rawEnd = (url.searchParams.get('endDate') || '').trim();
+  if (rawStart && !parseDateStr(rawStart)) return json(res, { error: '开始日期格式应为 YYYY-MM-DD' }, 400);
+  if (rawEnd && !parseDateStr(rawEnd)) return json(res, { error: '结束日期格式应为 YYYY-MM-DD' }, 400);
+  const startDate = rawStart ? formatDateStr(parseDateStr(rawStart)) : win.startDate;
+  const endDate = rawEnd ? formatDateStr(parseDateStr(rawEnd)) : win.endDate;
+  if (startDate > endDate) return json(res, { error: '开始日期不能晚于结束日期' }, 400);
   const device = url.searchParams.get('device') || '';
   const shift = url.searchParams.get('shift');
 
@@ -2566,11 +3693,21 @@ function getShiftConfigs(req, res) {
   json(res, { shifts, mode: active.length ? 'shift' : 'day' });
 }
 
-function validateShift(body, excludeId) {
-  const code = String((body && body.shift_code) || '').trim();
-  const name = String((body && body.shift_name) || '').trim();
-  const start = String((body && body.start_time) || '').trim();
-  const end = String((body && body.end_time) || '').trim();
+// 班次时间区间：跨天班次拆成 [start, 24:00] + [00:00, end] 两段用于重叠判断
+function shiftIntervals(start, end) {
+  if (start < end) return [[start, end]];
+  return [[start, '24:00'], ['00:00', end]];
+}
+
+function shiftsOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+function validateShift(body, excludeId, isActive = true) {
+  const code = toText(body && body.shift_code);
+  const name = toText(body && body.shift_name);
+  const start = toText(body && body.start_time);
+  const end = toText(body && body.end_time);
   if (!name) return { error: '缺少班次名称' };
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) {
     return { error: '班次时间格式应为 HH:MM' };
@@ -2580,12 +3717,31 @@ function validateShift(body, excludeId) {
     const dup = db.prepare('SELECT id FROM shift_config WHERE shift_code = ? AND id <> ?').get(code, excludeId || 0);
     if (dup) return { error: `班次编码 ${code} 已存在` };
   }
+
+  // 启用的班次之间不允许时间重叠：重叠会导致统计归属「先匹配先得」，口径不确定
+  if (isActive) {
+    const others = db.prepare(`
+      SELECT id, shift_code, shift_name, start_time, end_time
+      FROM shift_config
+      WHERE id <> ? AND COALESCE(is_active, 1) = 1
+    `).all(excludeId || 0);
+    const mine = shiftIntervals(start, end);
+    for (const other of others) {
+      const theirs = shiftIntervals(other.start_time, other.end_time);
+      const hit = mine.some(([s1, e1]) => theirs.some(([s2, e2]) => shiftsOverlap(s1, e1, s2, e2)));
+      if (hit) {
+        return { error: `班次时间与【${other.shift_name}（${other.start_time}-${other.end_time}）】重叠，请调整后再保存` };
+      }
+    }
+  }
+
   return { code, name, start, end };
 }
 
 // POST /api/stats/shifts/create - 新增班次
 function createShiftConfig(req, res, body) {
-  const valid = validateShift(body, null);
+  const isActive = body.is_active == null ? 1 : (Number(body.is_active) ? 1 : 0);
+  const valid = validateShift(body, null, isActive === 1);
   if (valid.error) return json(res, { error: valid.error }, 400);
 
   let code = valid.code;
@@ -2596,16 +3752,26 @@ function createShiftConfig(req, res, body) {
       i += 1;
     } while (db.prepare('SELECT id FROM shift_config WHERE shift_code = ?').get(code));
   }
-  const order = Number(body.sort_order);
-  const sortOrder = Number.isNaN(order) ? (db.prepare('SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shift_config').get().n) : order;
+
+  let sortOrder = shiftSortOrder(body.sort_order, null);
+  if (sortOrder === null) return json(res, { error: '排序号必须为整数' }, 400);
 
   const info = db.prepare(`
     INSERT INTO shift_config (shift_code, shift_name, start_time, end_time, sort_order, is_active)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(code, valid.name, valid.start, valid.end, sortOrder,
-    body.is_active == null ? 1 : (Number(body.is_active) ? 1 : 0));
+  `).run(code, valid.name, valid.start, valid.end, sortOrder, isActive);
 
   json(res, { success: true, shift: db.prepare('SELECT * FROM shift_config WHERE id = ?').get(info.lastInsertRowid) });
+}
+
+// 排序号：未提供时取 MAX+1；提供时必须为安全整数（避免 NaN 写成 NULL）
+function shiftSortOrder(value, current) {
+  if (value === null || value === undefined || value === '') {
+    if (current !== null && current !== undefined) return current;
+    return db.prepare('SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shift_config').get().n;
+  }
+  const num = toFiniteNumber(value);
+  return num !== null && Number.isSafeInteger(num) ? num : null;
 }
 
 // POST /api/stats/shifts/update - 修改班次
@@ -2614,38 +3780,49 @@ function updateShiftConfig(req, res, body) {
   const shift = db.prepare('SELECT * FROM shift_config WHERE id = ?').get(id);
   if (!shift) return json(res, { error: '班次不存在' }, 404);
 
+  const isActive = body.is_active != null ? (Number(body.is_active) ? 1 : 0) : shift.is_active;
   const merged = {
     shift_code: body.shift_code !== undefined ? body.shift_code : shift.shift_code,
     shift_name: body.shift_name !== undefined ? body.shift_name : shift.shift_name,
     start_time: body.start_time !== undefined ? body.start_time : shift.start_time,
     end_time: body.end_time !== undefined ? body.end_time : shift.end_time,
   };
-  const valid = validateShift(merged, id);
+  const valid = validateShift(merged, id, Number(isActive) === 1);
   if (valid.error) return json(res, { error: valid.error }, 400);
   const code = valid.code || shift.shift_code;
+
+  const sortOrder = shiftSortOrder(body.sort_order, shift.sort_order);
+  if (sortOrder === null) return json(res, { error: '排序号必须为整数' }, 400);
 
   db.prepare(`
     UPDATE shift_config
     SET shift_code = ?, shift_name = ?, start_time = ?, end_time = ?,
         sort_order = ?, is_active = ?, updated_at = datetime('now','localtime')
     WHERE id = ?
-  `).run(
-    code, valid.name, valid.start, valid.end,
-    body.sort_order != null ? Number(body.sort_order) : shift.sort_order,
-    body.is_active != null ? (Number(body.is_active) ? 1 : 0) : shift.is_active,
-    id
-  );
+  `).run(code, valid.name, valid.start, valid.end, sortOrder, isActive, id);
 
   json(res, { success: true, shift: db.prepare('SELECT * FROM shift_config WHERE id = ?').get(id) });
 }
 
 // POST /api/stats/shifts/delete - 删除班次
+//   已被统计数据引用时需显式传入 force=true，避免历史统计失去班次名称
 function deleteShiftConfig(req, res, body) {
   const id = Number(body && body.id);
   const shift = db.prepare('SELECT * FROM shift_config WHERE id = ?').get(id);
   if (!shift) return json(res, { error: '班次不存在' }, 404);
+
+  const used = tableExists('production_stats')
+    ? db.prepare('SELECT COUNT(*) AS c FROM production_stats WHERE shift_code = ?').get(shift.shift_code).c
+    : 0;
+  const force = body && (body.force === true || body.force === 'true' || Number(body.force) === 1);
+  if (used > 0 && !force) {
+    return json(res, {
+      error: `班次【${shift.shift_name}】已被 ${used} 条生产统计引用，删除后这些记录将失去班次配置；如确认删除请传入 force=true`,
+    }, 400);
+  }
+
   db.prepare('DELETE FROM shift_config WHERE id = ?').run(id);
-  json(res, { success: true });
+  json(res, { success: true, affectedStats: used });
 }
 
 // POST /api/stats/shifts/init - 一键生成标准班次（白班 / 夜班）
@@ -2680,8 +3857,14 @@ function rebuildProductionStats(req, res, body) {
       return;
     }
     const today = formatDateStr(new Date());
-    const startDate = (body && body.startDate) || addDays(today, -1);
-    const endDate = (body && body.endDate) || today;
+    const rawStart = toText(body && body.startDate);
+    const rawEnd = toText(body && body.endDate);
+    if (rawStart && !parseDateStr(rawStart)) return json(res, { error: '开始日期格式应为 YYYY-MM-DD' }, 400);
+    if (rawEnd && !parseDateStr(rawEnd)) return json(res, { error: '结束日期格式应为 YYYY-MM-DD' }, 400);
+    const startDate = rawStart ? formatDateStr(parseDateStr(rawStart)) : addDays(today, -1);
+    const endDate = rawEnd ? formatDateStr(parseDateStr(rawEnd)) : today;
+    if (startDate > endDate) return json(res, { error: '结束日期不能早于开始日期' }, 400);
+
     const result = calcProductionStats(startDate, endDate);
     json(res, { success: true, ...result });
   } catch (e) {
@@ -2696,14 +3879,100 @@ function rebuildProductionStats(req, res, body) {
 //   计划指定了 product_model 时，只统计该产品的记录
 //   与生产统计口径一致，不落库、每次查询实时计算，计划进行中即可看到进度
 
-const PLAN_STATUS = ['running', 'completed', 'cancelled'];
+// 计划状态（完整流转：起草 → 下达 → 执行 ⇄ 暂停 → 完成 → 结案，另有取消）
+const PLAN_STATUS = ['draft', 'issued', 'running', 'paused', 'completed', 'closed', 'cancelled'];
 
-// 计划状态机：进行中 → 完成/取消；已取消 → 恢复为进行中；已完成 → 不可再变更
-const PLAN_TRANSITIONS = {
-  running: ['completed', 'cancelled'],
-  cancelled: ['running'],
-  completed: [],
+const PLAN_STATUS_TEXT = {
+  draft: '起草中',
+  issued: '已下达',
+  running: '执行中',
+  paused: '已暂停',
+  completed: '已完成',
+  closed: '已结案',
+  cancelled: '已取消',
 };
+
+// 动作名（写流转日志用）
+const PLAN_ACTION_TEXT = {
+  issued: '下达',
+  running: '开始执行',
+  paused: '暂停',
+  completed: '完成',
+  closed: '结案',
+  cancelled: '取消',
+  draft: '撤回/恢复起草',
+};
+
+// 计划状态机：
+//   draft     → issued / cancelled
+//   issued    → running / draft(撤回) / cancelled
+//   running   → paused / completed / cancelled
+//   paused    → running(恢复) / cancelled
+//   completed → closed
+//   closed    → 终态
+//   cancelled → draft(恢复起草)
+const PLAN_TRANSITIONS = {
+  draft: ['issued', 'cancelled'],
+  issued: ['running', 'draft', 'cancelled'],
+  running: ['paused', 'completed', 'cancelled'],
+  paused: ['running', 'cancelled'],
+  completed: ['closed'],
+  closed: [],
+  cancelled: ['draft'],
+};
+
+// 已下达后不可再修改排产要素（设备/产品/计划数/周期/编号），仅可改名称与备注
+const PLAN_LOCKED_FIELDS = ['plan_code', 'device_code', 'product_model', 'plan_count', 'start_time', 'end_time'];
+
+// 同设备执行区间冲突检测：同一设备同一时间段只允许一个计划执行（不同设备互不影响）
+//   newStart ~ newEnd 为本计划即将占用的区间，otherEnd 取对方段的结束时间（未结束视为无限远）
+function findPlanConflict(deviceCode, planId, newStart, newEnd) {
+  return db.prepare(`
+    SELECT p.id, p.plan_code, p.plan_name, p.status, s.started_at, s.ended_at
+    FROM production_plan_segments s
+    JOIN production_plans p ON p.id = s.plan_id
+    WHERE p.device_code = ?
+      AND p.id <> ?
+      AND s.started_at <= ?
+      AND COALESCE(s.ended_at, '9999-12-31 23:59:59') > ?
+    ORDER BY s.started_at
+    LIMIT 1
+  `).get(deviceCode, planId, newEnd, newStart);
+}
+
+// 打开执行段（进入执行中，同一计划只保留一条未关闭的段）
+function openPlanSegment(planId, at) {
+  const opened = db.prepare(
+    'SELECT id FROM production_plan_segments WHERE plan_id = ? AND ended_at IS NULL LIMIT 1'
+  ).get(planId);
+  if (opened) return;
+  db.prepare('INSERT INTO production_plan_segments (plan_id, started_at) VALUES (?, ?)').run(planId, at);
+}
+
+// 关闭执行段（暂停 / 完成 / 取消）
+function closePlanSegment(planId, at) {
+  db.prepare(
+    'UPDATE production_plan_segments SET ended_at = ? WHERE plan_id = ? AND ended_at IS NULL'
+  ).run(at, planId);
+}
+
+// 清空执行段（撤回 / 恢复为起草后重新走流程）
+function clearPlanSegments(planId) {
+  db.prepare('DELETE FROM production_plan_segments WHERE plan_id = ?').run(planId);
+}
+
+function addPlanLog(planId, planCode, action, fromStatus, toStatus, operator, remark) {
+  try {
+    db.prepare(`
+      INSERT INTO production_plan_logs
+        (plan_id, plan_code, action, from_status, to_status, operator, remark)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(planId, planCode || '', action, fromStatus || '', toStatus || '',
+      operator || '系统', remark || '');
+  } catch (e) {
+    logWrite('ERROR', `写入计划流转日志失败: ${e && e.message ? e.message : e}`);
+  }
+}
 
 function planNow() {
   const d = new Date();
@@ -2713,18 +3982,30 @@ function planNow() {
 
 // 计划实际完成量（子查询），extra 为附加的 data_status 条件
 // 与生产统计口径一致：设备停用后其记录不再计入计划完成数
+// 计划完成数 = 各「执行段」内的工艺记录数之和
+//   仅统计计划周期内、落在本条计划实际执行区间（production_plan_segments）里的记录，
+//   因此暂停期间设备生产其他计划的产出不会计入本计划
 function planCountSql(extra = '') {
   return `(SELECT COUNT(*) FROM process_data x
     WHERE x.device_code = p.device_code
       AND x.collect_time >= p.start_time
       AND x.collect_time <= p.end_time
       AND (p.product_model IS NULL OR p.product_model = '' OR x.product_model = p.product_model)
-      AND EXISTS (SELECT 1 FROM devices dv WHERE dv.device_code = p.device_code AND dv.is_active = 1)${extra})`;
+      AND EXISTS (SELECT 1 FROM devices dv WHERE dv.device_code = p.device_code AND dv.is_active = 1)
+      AND EXISTS (SELECT 1 FROM production_plan_segments s
+                  WHERE s.plan_id = p.id
+                    AND x.collect_time >= s.started_at
+                    AND x.collect_time <= COALESCE(s.ended_at, datetime('now','localtime')))${extra})`;
 }
 
 function planSelectFields() {
   return `
     p.*, d.device_name,
+    -- 实际开始 / 结束时间以执行段为准，保证与完成数统计区间一致
+    (SELECT MIN(s.started_at) FROM production_plan_segments s WHERE s.plan_id = p.id) AS exec_start_at,
+    (CASE WHEN p.status IN ('completed', 'closed', 'cancelled')
+          THEN (SELECT MAX(s.ended_at) FROM production_plan_segments s WHERE s.plan_id = p.id)
+          ELSE NULL END) AS exec_end_at,
     ${planCountSql()} AS actual_count,
     ${planCountSql(" AND x.data_status = 'normal'")} AS qualified_count,
     ${planCountSql(" AND x.data_status = 'warning'")} AS warning_count,
@@ -2735,11 +4016,14 @@ function planSelectFields() {
 function decoratePlan(row, now) {
   const planCount = Number(row.plan_count) || 0;
   const actual = Number(row.actual_count) || 0;
+  // 未结束的计划（已下达 / 执行中 / 暂停）超出计划结束时间即视为超期
+  const open = ['issued', 'running', 'paused'].includes(row.status);
   return {
     ...row,
+    status_text: PLAN_STATUS_TEXT[row.status] || row.status,
     rate: planCount > 0 ? Math.min(actual / planCount, 1) : 0,
     rate_percent: planCount > 0 ? Number(((actual / planCount) * 100).toFixed(1)) : 0,
-    overdue: row.status === 'running' && String(row.end_time) < now ? 1 : 0,
+    overdue: open && String(row.end_time) < now ? 1 : 0,
   };
 }
 
@@ -2755,11 +4039,17 @@ function getPlanById(id) {
 
 // 把 datetime-local（2026-11-17T08:00）或 2026-11-17 08:00 统一为 YYYY-MM-DD HH:MM:SS
 function normalizePlanTime(value) {
-  const s = String(value || '').trim().replace('T', ' ');
+  const s = String(value == null ? '' : value).trim().replace('T', ' ');
   const m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ ](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
   if (!m) return '';
+  const [year, month, day, hour, minute, second] = [
+    Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0),
+  ];
+  // 形状匹配后仍需校验日历范围，否则 2026-13-45 25:00 会污染排序与统计
+  if (!isValidDateParts(year, month, day)) return '';
+  if (hour > 23 || minute > 59 || second > 59) return '';
   const pad = n => String(n).padStart(2, '0');
-  return `${m[1]}-${pad(m[2])}-${pad(m[3])} ${pad(m[4])}:${m[5]}:${m[6] || '00'}`;
+  return `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
 }
 
 function nextPlanCode() {
@@ -2771,23 +4061,29 @@ function nextPlanCode() {
   return `${prefix}-${String(i).padStart(3, '0')}`;
 }
 
+// 计划数允许范围：避免 1e21 之类数值被 SQLite 存为 REAL（排序 / 完成率失真）
+const PLAN_COUNT_MAX = 100000000;
+
 function validatePlan(body) {
-  const deviceCode = String((body && body.device_code) || '').trim();
-  const planCode = String((body && body.plan_code) || '').trim();
-  const planName = String((body && body.plan_name) || '').trim();
-  const productModel = String((body && body.product_model) || '').trim();
-  const planCount = Number(body && body.plan_count);
+  const deviceCode = toText(body && body.device_code);
+  const planCode = toText(body && body.plan_code);
+  const planName = toText(body && body.plan_name);
+  const productModel = toText(body && body.product_model);
+  const planCount = toFiniteNumber(body && body.plan_count);
   const start = normalizePlanTime(body && body.start_time);
   const end = normalizePlanTime(body && body.end_time);
-  const status = String((body && body.status) || 'running').trim();
-  const remark = String((body && body.remark) || '').trim();
+  // 新建计划一律从「起草」开始（状态只能通过 /api/plans/status 流转）
+  const status = toText(body && body.status) || 'draft';
+  const remark = toText(body && body.remark);
 
   if (!deviceCode) return { error: '请选择设备' };
   if (!db.prepare('SELECT id FROM devices WHERE device_code = ?').get(deviceCode)) {
     return { error: `设备编号 ${deviceCode} 不存在` };
   }
-  if (!Number.isInteger(planCount) || planCount <= 0) return { error: '计划数必须是大于 0 的整数' };
-  if (!start || !end) return { error: '计划时间格式应为 YYYY-MM-DD HH:MM' };
+  if (planCount === null || !Number.isSafeInteger(planCount) || planCount <= 0 || planCount > PLAN_COUNT_MAX) {
+    return { error: `计划数必须是 1 ~ ${PLAN_COUNT_MAX} 之间的整数` };
+  }
+  if (!start || !end) return { error: '计划时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' };
   if (start >= end) return { error: '计划结束时间必须晚于开始时间' };
   if (!PLAN_STATUS.includes(status)) return { error: '计划状态不合法' };
 
@@ -2802,6 +4098,8 @@ function getPlans(req, res) {
   const status = (url.searchParams.get('status') || '').trim();
   const startDate = (url.searchParams.get('startDate') || '').trim();
   const endDate = (url.searchParams.get('endDate') || '').trim();
+  if (startDate && !parseDateStr(startDate)) return json(res, { error: '开始日期格式应为 YYYY-MM-DD' }, 400);
+  if (endDate && !parseDateStr(endDate)) return json(res, { error: '结束日期格式应为 YYYY-MM-DD' }, 400);
   const { page, pageSize } = parsePaging(url, 20);
 
   let where = 'WHERE 1=1';
@@ -2816,45 +4114,68 @@ function getPlans(req, res) {
   if (endDate) { where += ' AND p.start_time <= ?'; params.push(`${endDate} 23:59:59`); }
 
   const now = planNow();
-  const rows = db.prepare(`
-    SELECT ${planSelectFields()}
+
+  // 汇总按状态分组聚合（不随分页变化），避免把全表读进内存再切片
+  const statusRows = db.prepare(`
+    SELECT p.status AS status, COUNT(*) AS cnt
     FROM production_plans p
     LEFT JOIN devices d ON d.device_code = p.device_code
     ${where}
-    ORDER BY CASE p.status WHEN 'running' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,
-             p.start_time DESC, p.id DESC
-  `).all(...params).map(r => decoratePlan(r, now));
+    GROUP BY p.status
+  `).all(...params);
 
   const summary = {
-    total: rows.length,
+    total: 0,
+    draft: 0,
+    issued: 0,
     running: 0,
+    paused: 0,
     completed: 0,
+    closed: 0,
     cancelled: 0,
     runningPlanCount: 0,
     runningActualCount: 0,
     runningQualifiedCount: 0,
     runningRate: 0,
   };
-  rows.forEach((r) => {
-    if (r.status === 'running') {
-      summary.running += 1;
-      summary.runningPlanCount += Number(r.plan_count) || 0;
-      summary.runningActualCount += Number(r.actual_count) || 0;
-      summary.runningQualifiedCount += Number(r.qualified_count) || 0;
-    } else if (r.status === 'completed') {
-      summary.completed += 1;
-    } else {
-      summary.cancelled += 1;
-    }
+  statusRows.forEach((r) => {
+    const cnt = Number(r.cnt) || 0;
+    summary.total += cnt;
+    if (summary[r.status] !== undefined) summary[r.status] += cnt;
+  });
+
+  // 运行中计划的完成量单独聚合（只有 running 行需要跑相关子查询）
+  const runningRows = db.prepare(`
+    SELECT ${planSelectFields()}
+    FROM production_plans p
+    LEFT JOIN devices d ON d.device_code = p.device_code
+    ${where} AND p.status = 'running'
+  `).all(...params);
+  runningRows.forEach((r) => {
+    summary.runningPlanCount += Number(r.plan_count) || 0;
+    summary.runningActualCount += Number(r.actual_count) || 0;
+    summary.runningQualifiedCount += Number(r.qualified_count) || 0;
   });
   if (summary.runningPlanCount > 0) {
     summary.runningRate = Number(((summary.runningActualCount / summary.runningPlanCount) * 100).toFixed(1));
   }
 
-  const total = rows.length;
+  const total = summary.total;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(page, totalPages);
-  const data = rows.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  const data = db.prepare(`
+    SELECT ${planSelectFields()}
+    FROM production_plans p
+    LEFT JOIN devices d ON d.device_code = p.device_code
+    ${where}
+    ORDER BY CASE p.status
+               WHEN 'running' THEN 0 WHEN 'paused' THEN 1 WHEN 'issued' THEN 2
+               WHEN 'draft' THEN 3 WHEN 'completed' THEN 4 WHEN 'closed' THEN 5 ELSE 6
+             END,
+             p.start_time DESC, p.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, (safePage - 1) * pageSize).map(r => decoratePlan(r, now));
 
   json(res, { total, page: safePage, pageSize, totalPages, summary, data });
 }
@@ -2864,8 +4185,13 @@ function getPlans(req, res) {
 function exportPlans(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const win = exportDateWindow();
-  const startDate = (url.searchParams.get('startDate') || '').trim() || win.startDate;
-  const endDate = (url.searchParams.get('endDate') || '').trim() || win.endDate;
+  const rawStart = (url.searchParams.get('startDate') || '').trim();
+  const rawEnd = (url.searchParams.get('endDate') || '').trim();
+  if (rawStart && !parseDateStr(rawStart)) return json(res, { error: '开始日期格式应为 YYYY-MM-DD' }, 400);
+  if (rawEnd && !parseDateStr(rawEnd)) return json(res, { error: '结束日期格式应为 YYYY-MM-DD' }, 400);
+  const startDate = rawStart ? formatDateStr(parseDateStr(rawStart)) : win.startDate;
+  const endDate = rawEnd ? formatDateStr(parseDateStr(rawEnd)) : win.endDate;
+  if (startDate > endDate) return json(res, { error: '开始日期不能晚于结束日期' }, 400);
   const keyword = (url.searchParams.get('keyword') || '').trim();
   const device = (url.searchParams.get('device') || '').trim();
   const status = (url.searchParams.get('status') || '').trim();
@@ -2889,10 +4215,11 @@ function exportPlans(req, res) {
     LIMIT ${EXPORT_MAX_ROWS}
   `).all(...params).map((r) => decoratePlan(r, now));
 
-  const STATUS_TEXT = { running: '进行中', completed: '已完成', cancelled: '已取消' };
   const headers = [
     '计划编号', '计划名称', '设备编号', '设备名称', '产品型号', '计划数',
-    '完成数', '合格数', '完成率(%)', '状态', '开始时间', '结束时间', '备注',
+    '完成数', '合格数', '完成率(%)', '状态', '下达时间', '开始执行时间',
+    '暂停时间', '暂停原因', '完成时间', '结案时间', '取消时间',
+    '计划开始时间', '计划结束时间', '备注',
   ];
   const body = rows.map((r) => [
     r.plan_code,
@@ -2904,7 +4231,14 @@ function exportPlans(req, res) {
     Number(r.actual_count) || 0,
     Number(r.qualified_count) || 0,
     r.rate_percent,
-    STATUS_TEXT[r.status] || r.status,
+    PLAN_STATUS_TEXT[r.status] || r.status,
+    r.issued_at || '',
+    r.started_at || '',
+    r.paused_at || '',
+    r.pause_reason || '',
+    r.completed_at || '',
+    r.closed_at || '',
+    r.cancelled_at || '',
     r.start_time,
     r.end_time,
     r.remark || '',
@@ -2928,7 +4262,14 @@ function getPlanOptions(req, res) {
   json(res, { devices, products });
 }
 
-// POST /api/plans/create - 新增计划
+// 计划操作人：优先取登录用户；仅机器令牌等无用户场景才回落到请求体
+function planOperator(req, body) {
+  const user = req && req.user;
+  if (user && user.username) return user.username;
+  return toText(body && body.operator) || '系统';
+}
+
+// POST /api/plans/create - 新增计划（一律从「起草」状态开始）
 function createPlan(req, res, body) {
   const valid = validatePlan(body);
   if (valid.error) return json(res, { error: valid.error }, 400);
@@ -2938,21 +4279,35 @@ function createPlan(req, res, body) {
     return json(res, { error: `计划编号 ${code} 已存在` }, 400);
   }
 
-  const info = db.prepare(`
-    INSERT INTO production_plans
-      (plan_code, plan_name, device_code, product_model, plan_count, start_time, end_time, status, remark)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(code, valid.planName, valid.deviceCode, valid.productModel, valid.planCount,
-    valid.start, valid.end, valid.status, valid.remark);
+  let newId = null;
+  db.transaction(() => {
+    const info = db.prepare(`
+      INSERT INTO production_plans
+        (plan_code, plan_name, device_code, product_model, plan_count, start_time, end_time, status, remark)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+    `).run(code, valid.planName, valid.deviceCode, valid.productModel, valid.planCount,
+      valid.start, valid.end, valid.remark);
+    newId = info.lastInsertRowid;
+    addPlanLog(newId, code, 'create', '', 'draft', planOperator(req, body), '新建计划（起草）');
+  })();
 
-  json(res, { success: true, plan: getPlanById(info.lastInsertRowid) });
+  json(res, { success: true, plan: getPlanById(newId) });
 }
 
 // POST /api/plans/update - 修改计划
+//   起草：可改全部字段
+//   已下达 / 执行中 / 暂停：仅可改计划名称与备注（排产要素已生效，需先撤回为起草）
+//   已完成 / 已结案 / 已取消：不可编辑
 function updatePlan(req, res, body) {
   const id = Number(body && body.id);
   const plan = db.prepare('SELECT * FROM production_plans WHERE id = ?').get(id);
   if (!plan) return json(res, { error: '计划不存在' }, 404);
+
+  if (!['draft', 'issued', 'running', 'paused'].includes(plan.status)) {
+    return json(res, {
+      error: `计划当前为「${PLAN_STATUS_TEXT[plan.status] || plan.status}」，不可编辑`,
+    }, 400);
+  }
 
   const merged = {
     plan_code: body.plan_code !== undefined ? body.plan_code : plan.plan_code,
@@ -2973,57 +4328,272 @@ function updatePlan(req, res, body) {
   const dup = db.prepare('SELECT id FROM production_plans WHERE plan_code = ? AND id <> ?').get(code, id);
   if (dup) return json(res, { error: `计划编号 ${code} 已存在` }, 400);
 
-  // 切到结束/取消时记录结束时间；状态未变则保留原值
-  const completedAt = valid.status === 'running'
-    ? null
-    : (plan.status === valid.status ? plan.completed_at : planNow());
+  if (plan.status !== 'draft') {
+    const nextValues = {
+      plan_code: code,
+      device_code: valid.deviceCode,
+      product_model: valid.productModel,
+      plan_count: String(valid.planCount),
+      start_time: valid.start,
+      end_time: valid.end,
+    };
+    const changed = PLAN_LOCKED_FIELDS.filter(
+      (key) => String(nextValues[key] ?? '') !== String(plan[key] ?? '')
+    );
+    if (changed.length) {
+      return json(res, {
+        error: '计划已下达，仅可修改计划名称与备注；如需调整排产请先「撤回」为起草',
+      }, 400);
+    }
+  }
 
-  db.prepare(`
-    UPDATE production_plans
-    SET plan_code = ?, plan_name = ?, device_code = ?, product_model = ?, plan_count = ?,
-        start_time = ?, end_time = ?, status = ?, completed_at = ?, remark = ?,
-        updated_at = datetime('now','localtime')
-    WHERE id = ?
-  `).run(code, valid.planName, valid.deviceCode, valid.productModel, valid.planCount,
-    valid.start, valid.end, valid.status, completedAt, valid.remark, id);
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE production_plans
+      SET plan_code = ?, plan_name = ?, device_code = ?, product_model = ?, plan_count = ?,
+          start_time = ?, end_time = ?, remark = ?, updated_at = datetime('now','localtime')
+      WHERE id = ?
+    `).run(code, valid.planName, valid.deviceCode, valid.productModel, valid.planCount,
+      valid.start, valid.end, valid.remark, id);
+    addPlanLog(id, code, 'update', plan.status, plan.status, planOperator(req, body), '修改计划信息');
+  })();
 
   json(res, { success: true, plan: getPlanById(id) });
 }
 
-// POST /api/plans/status - 结束 / 取消 / 恢复计划
+// POST /api/plans/status - 计划状态流转
+//   body: { id, status, remark, operator }
+//   status: issued(下达) / running(开始执行·恢复) / paused(暂停) / completed(完成)
+//           / closed(结案) / cancelled(取消) / draft(撤回·恢复起草)
 function updatePlanStatus(req, res, body) {
   const id = Number(body && body.id);
-  const status = String((body && body.status) || '').trim();
+  const status = toText(body && body.status);
+  const remark = toText(body && body.remark);
   if (!PLAN_STATUS.includes(status)) return json(res, { error: '计划状态不合法' }, 400);
+  if (!Number.isSafeInteger(id) || id <= 0) return json(res, { error: '计划不存在' }, 404);
 
   const plan = db.prepare('SELECT * FROM production_plans WHERE id = ?').get(id);
   if (!plan) return json(res, { error: '计划不存在' }, 404);
+  // 重复设置同一状态视为幂等
+  if (plan.status === status) return json(res, { success: true, plan: getPlanById(id) });
 
-  // 只允许状态机内的流转，重复设置同一状态视为幂等
-  if (plan.status !== status && !(PLAN_TRANSITIONS[plan.status] || []).includes(status)) {
-    return json(res, { error: `不允许将计划从「${plan.status}」变更为「${status}」` }, 400);
+  if (!(PLAN_TRANSITIONS[plan.status] || []).includes(status)) {
+    return json(res, {
+      error: `不允许将计划从「${PLAN_STATUS_TEXT[plan.status] || plan.status}」变更为「${PLAN_STATUS_TEXT[status] || status}」`,
+    }, 400);
+  }
+  if (status === 'paused' && !remark) {
+    return json(res, { error: '暂停计划需填写暂停原因' }, 400);
   }
 
-  const completedAt = status === 'running'
-    ? null
-    : (plan.status === status ? plan.completed_at : planNow());
+  const now = planNow();
 
-  db.prepare(`
-    UPDATE production_plans
-    SET status = ?, completed_at = ?, updated_at = datetime('now','localtime')
-    WHERE id = ?
-  `).run(status, completedAt, id);
+  // 实际发生时间：仅「首次开始执行」与「完成」允许手工补录（操作滞后于实际生产时使用）
+  //   暂停 / 恢复 / 取消 / 下达 / 结案仍按实际切换时间，保证暂停记录真实
+  let occurredAt = now;
+  const firstStart = status === 'running' && !plan.started_at;
+  const manualAllowed = status === 'completed' || firstStart;
+  const rawOccurred = toText(body && body.occurred_at);
+  if (rawOccurred && manualAllowed) {
+    occurredAt = normalizePlanTime(rawOccurred);
+    if (!occurredAt) return json(res, { error: '时间格式应为 YYYY-MM-DD HH:MM，且必须是有效日期' }, 400);
+    if (occurredAt > now) return json(res, { error: '填报时间不能晚于当前时间' }, 400);
+  }
+
+  // 填报时间必须落在计划周期内：早于计划开始 / 晚于计划结束会造成
+  // 「设备被长期占用但完成数为 0」的口径错位
+  if ((status === 'running' || status === 'completed') && occurredAt < plan.start_time) {
+    return json(res, {
+      error: `填报时间不能早于计划开始时间（${plan.start_time}）`,
+    }, 400);
+  }
+  if (status === 'running' && plan.end_time && occurredAt > plan.end_time) {
+    return json(res, {
+      error: `计划周期已于 ${plan.end_time} 结束，请先撤回为起草并调整计划周期后再执行`,
+    }, 400);
+  }
+
+  // 同一设备同一时间段只允许一个计划执行：开始 / 恢复执行前校验执行区间是否与其它计划重叠
+  if (status === 'running') {
+    const newEnd = plan.end_time && plan.end_time > occurredAt ? plan.end_time : occurredAt;
+    const conflict = findPlanConflict(plan.device_code, id, occurredAt, newEnd);
+    if (conflict) {
+      const range = conflict.ended_at
+        ? `${conflict.started_at} ~ ${conflict.ended_at}`
+        : `${conflict.started_at} ~ 至今`;
+      return json(res, {
+        error: `设备 ${plan.device_code} 在该时段已被计划【${conflict.plan_code}${conflict.plan_name ? ' ' + conflict.plan_name : ''}】占用（${range}），同一设备同一时间只能执行一个计划；请先完成或暂停该计划`,
+      }, 400);
+    }
+  }
+
+  if (status === 'completed') {
+    const opened = db.prepare(`
+      SELECT started_at FROM production_plan_segments
+      WHERE plan_id = ? AND ended_at IS NULL
+      ORDER BY id DESC LIMIT 1
+    `).get(id);
+    if (opened && occurredAt < opened.started_at) {
+      return json(res, {
+        error: `完成时间不能早于本次执行开始时间（${opened.started_at}）`,
+      }, 400);
+    }
+  }
+
+  const sets = ['status = ?', "updated_at = datetime('now','localtime')"];
+  const params = [status];
+
+  if (status === 'issued') {
+    sets.push('issued_at = ?', 'cancelled_at = NULL');
+    params.push(now);
+  }
+  if (status === 'running') {
+    // 首次开始执行按填报时间，恢复执行保留首次时间
+    sets.push('started_at = COALESCE(started_at, ?)', 'paused_at = NULL');
+    params.push(occurredAt);
+  }
+  if (status === 'paused') {
+    sets.push('paused_at = ?', 'pause_reason = ?');
+    params.push(now, remark);
+  }
+  if (status === 'completed') {
+    sets.push('completed_at = ?', 'pause_reason = NULL');
+    params.push(occurredAt);
+  }
+  if (status === 'closed') {
+    sets.push('closed_at = ?');
+    params.push(now);
+  }
+  if (status === 'cancelled') {
+    sets.push('cancelled_at = ?');
+    params.push(now);
+  }
+  if (status === 'draft') {
+    // 撤回 / 恢复起草：清空流程时间戳，重新走一遍流程
+    sets.push('issued_at = NULL', 'started_at = NULL', 'paused_at = NULL',
+      'pause_reason = NULL', 'completed_at = NULL', 'closed_at = NULL', 'cancelled_at = NULL');
+  }
+
+  const operator = planOperator(req, body);
+  const commit = db.transaction(() => {
+    db.prepare(`UPDATE production_plans SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
+
+    // 维护执行段：
+    //   执行中 → 开启一段（首次开始 / 暂停后恢复）
+    //   暂停 / 完成 / 取消 → 关闭当前段，暂停期间的产出不计入本计划
+    //   撤回 / 恢复起草 → 清空所有段，重新走流程
+    if (status === 'running') openPlanSegment(id, occurredAt);
+    if (['paused', 'completed', 'cancelled'].includes(status)) closePlanSegment(id, occurredAt);
+    if (status === 'draft') clearPlanSegments(id);
+
+    addPlanLog(id, plan.plan_code, status, plan.status, status, operator,
+      remark || PLAN_ACTION_TEXT[status] || status);
+  });
+  commit();
 
   json(res, { success: true, plan: getPlanById(id) });
 }
 
-// POST /api/plans/delete - 删除计划
+// POST /api/plans/delete - 删除计划（仅起草 / 已取消可删除）
 function deletePlan(req, res, body) {
   const id = Number(body && body.id);
   const plan = db.prepare('SELECT * FROM production_plans WHERE id = ?').get(id);
   if (!plan) return json(res, { error: '计划不存在' }, 404);
-  db.prepare('DELETE FROM production_plans WHERE id = ?').run(id);
+  if (!['draft', 'cancelled'].includes(plan.status)) {
+    return json(res, {
+      error: `计划当前为「${PLAN_STATUS_TEXT[plan.status] || plan.status}」，不可删除；如需终止请先取消计划`,
+    }, 400);
+  }
+
+  addPlanLog(id, plan.plan_code, 'delete', plan.status, '', planOperator(req, body), '删除计划');
+  const remove = db.transaction(() => {
+    // 计划删除后执行段一起清理；流转日志保留用于追溯
+    clearPlanSegments(id);
+    db.prepare('DELETE FROM production_plans WHERE id = ?').run(id);
+  });
+  remove();
   json(res, { success: true });
+}
+
+// GET /api/plans/logs - 计划状态流转记录（?id= 过滤单条计划，?limit= 限制条数）
+function getPlanLogs(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const id = Number(url.searchParams.get('id'));
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
+  const rows = id
+    ? db.prepare(`
+        SELECT * FROM production_plan_logs
+        WHERE plan_id = ?
+        ORDER BY operate_time DESC, id DESC
+        LIMIT ?
+      `).all(id, limit)
+    : db.prepare(`
+        SELECT * FROM production_plan_logs
+        ORDER BY operate_time DESC, id DESC
+        LIMIT ?
+      `).all(limit);
+  json(res, rows);
+}
+
+// GET /api/plans/records - 计划关联的工艺数据（口径与完成数一致）
+//   设备 + 计划周期 ∩ 执行段 + 可选产品 + 设备启用
+function getPlanRecords(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const id = Number(url.searchParams.get('id'));
+  const page = Math.min(PAGE_MAX, Math.max(1, Number(url.searchParams.get('page')) || 1));
+  const pageSize = Math.min(Math.max(Number(url.searchParams.get('pageSize')) || 20, 1), 100);
+
+  const plan = db.prepare('SELECT * FROM production_plans WHERE id = ?').get(id);
+  if (!plan) return json(res, { error: '计划不存在' }, 404);
+
+  const where = [];
+  const params = [];
+
+  where.push('x.device_code = ?');
+  params.push(plan.device_code);
+  where.push('x.collect_time >= ?', 'x.collect_time <= ?');
+  params.push(plan.start_time, plan.end_time);
+  if (plan.product_model) {
+    where.push('x.product_model = ?');
+    params.push(plan.product_model);
+  }
+  where.push(`EXISTS (SELECT 1 FROM production_plan_segments s
+      WHERE s.plan_id = ?
+        AND x.collect_time >= s.started_at
+        AND x.collect_time <= COALESCE(s.ended_at, datetime('now','localtime')))`);
+  params.push(plan.id);
+  where.push('EXISTS (SELECT 1 FROM devices dv WHERE dv.device_code = x.device_code AND dv.is_active = 1)');
+
+  const whereSql = where.join(' AND ');
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM process_data x WHERE ${whereSql}`)
+    .get(...params).c;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages);
+
+  const rows = db.prepare(`
+    SELECT x.* FROM process_data x
+    WHERE ${whereSql}
+    ORDER BY x.collect_time DESC, x.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, (safePage - 1) * pageSize);
+
+  // total 与该计划的完成数同口径，直接回填给弹窗展示
+  const planView = decoratePlan(plan, planNow());
+  planView.actual_count = total;
+  planView.rate = planView.plan_count > 0 ? Math.min(total / planView.plan_count, 1) : 0;
+  planView.rate_percent = planView.plan_count > 0
+    ? Number(((total / planView.plan_count) * 100).toFixed(1))
+    : 0;
+
+  json(res, {
+    total,
+    page: safePage,
+    pageSize,
+    totalPages,
+    data: rows,
+    params: processParamList(),
+    plan: planView,
+  });
 }
 
 // ==================== 启动时数据库结构升级 ====================
@@ -3050,8 +4620,17 @@ function ensureDeviceCodes() {
     const taken = db.prepare('SELECT id FROM devices WHERE device_code = ? AND id <> ?').get(target, d.id);
     if (taken) return;
     db.prepare("UPDATE devices SET device_code = ?, updated_at = datetime('now','localtime') WHERE id = ?").run(target, d.id);
-    if (tableExists('process_data') && d.device_code) {
-      db.prepare('UPDATE process_data SET device_code = ? WHERE device_code = ?').run(target, d.device_code);
+    if (d.device_code) {
+      // 与接口改名保持一致：工艺数据 / 生产计划 / 生产统计同时迁移，避免计划悬空
+      if (tableExists('process_data')) {
+        db.prepare('UPDATE process_data SET device_code = ? WHERE device_code = ?').run(target, d.device_code);
+      }
+      if (tableExists('production_plans')) {
+        db.prepare('UPDATE production_plans SET device_code = ? WHERE device_code = ?').run(target, d.device_code);
+      }
+      if (tableExists('production_stats')) {
+        db.prepare('UPDATE production_stats SET device_code = ? WHERE device_code = ?').run(target, d.device_code);
+      }
     }
     logWrite('MIGRATE', `设备编号统一：${d.device_name} ${d.device_code || '(空)'} → ${target}`);
   });
@@ -3092,8 +4671,14 @@ function ensurePlanSchema() {
       plan_count INTEGER NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'running',
+      status TEXT NOT NULL DEFAULT 'draft',
+      issued_at TEXT,
+      started_at TEXT,
+      paused_at TEXT,
+      pause_reason TEXT,
       completed_at TEXT,
+      closed_at TEXT,
+      cancelled_at TEXT,
       remark TEXT,
       created_at TEXT DEFAULT (datetime('now','localtime')),
       updated_at TEXT DEFAULT (datetime('now','localtime'))
@@ -3101,7 +4686,99 @@ function ensurePlanSchema() {
     CREATE INDEX IF NOT EXISTS idx_plan_device ON production_plans(device_code);
     CREATE INDEX IF NOT EXISTS idx_plan_time ON production_plans(start_time, end_time);
     CREATE INDEX IF NOT EXISTS idx_plan_status ON production_plans(status);
+
+    CREATE TABLE IF NOT EXISTS production_plan_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id INTEGER NOT NULL,
+      plan_code TEXT,
+      action TEXT NOT NULL,
+      from_status TEXT,
+      to_status TEXT,
+      operator TEXT,
+      remark TEXT,
+      operate_time TEXT DEFAULT (datetime('now','localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_log_plan ON production_plan_logs(plan_id, operate_time DESC);
+
+    CREATE TABLE IF NOT EXISTS production_plan_segments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id INTEGER NOT NULL,
+      started_at TEXT NOT NULL,
+      ended_at TEXT,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_seg_plan ON production_plan_segments(plan_id, started_at);
+    -- 冲突检测按开始时间过滤（join 设备后无法用 plan_id 前缀），单独建时间索引
+    CREATE INDEX IF NOT EXISTS idx_plan_seg_time ON production_plan_segments(started_at);
   `);
+
+  // 老库补列：状态流转相关时间戳（新增字段无需重跑 init_all.sql）
+  const cols = tableColumns('production_plans');
+  [
+    ['issued_at', 'TEXT'],
+    ['started_at', 'TEXT'],
+    ['paused_at', 'TEXT'],
+    ['pause_reason', 'TEXT'],
+    ['closed_at', 'TEXT'],
+    ['cancelled_at', 'TEXT'],
+  ].forEach(([name, type]) => {
+    if (cols.includes(name)) return;
+    db.exec(`ALTER TABLE production_plans ADD COLUMN ${name} ${type}`);
+  });
+
+  // 老库升级：为已有计划补建执行段，保证历史完成数与改造前一致
+  try {
+    const segCount = db.prepare('SELECT COUNT(1) AS c FROM production_plan_segments WHERE plan_id = ?');
+    const insertSeg = db.prepare(
+      'INSERT INTO production_plan_segments (plan_id, started_at, ended_at) VALUES (?, ?, ?)'
+    );
+    const plans = db.prepare(`
+      SELECT id, status, issued_at, started_at, start_time, end_time,
+             paused_at, completed_at, closed_at, cancelled_at, created_at
+      FROM production_plans
+    `).all();
+
+    const migrate = db.transaction(() => {
+      plans.forEach((p) => {
+        if (segCount.get(p.id).c > 0) return;
+        if (!['running', 'paused', 'completed', 'closed', 'cancelled'].includes(p.status)) return;
+        // 执行中 / 暂停：从实际开始执行时间起算；已完成 / 结案 / 取消：沿用原统计口径（整个计划周期）
+        const start = ['running', 'paused'].includes(p.status)
+          ? (p.started_at || p.issued_at || p.start_time || p.created_at)
+          : (p.start_time || p.started_at || p.created_at);
+        let end = null;
+        if (p.status === 'paused') {
+          end = p.paused_at || planNow();
+        } else if (p.status !== 'running') {
+          end = p.end_time || p.completed_at || p.closed_at || p.cancelled_at || planNow();
+        }
+        insertSeg.run(p.id, start, end);
+      });
+    });
+    migrate();
+  } catch (e) {
+    logWrite('ERROR', `补建计划执行段失败: ${e && e.message ? e.message : e}`);
+  }
+}
+
+// 名称唯一性最终应由数据库唯一索引保证（避免「先查再插」的并发窗口）。
+// 老库可能存在重复数据，检测到重复时跳过创建并告警，避免服务启动失败。
+function ensureUniqueIndexSafely(tableName, columnName, indexName) {
+  if (!tableExists(tableName)) return;
+  try {
+    const dup = db.prepare(`
+      SELECT ${columnName} AS v FROM ${tableName}
+      WHERE ${columnName} IS NOT NULL AND ${columnName} <> ''
+      GROUP BY ${columnName} HAVING COUNT(*) > 1 LIMIT 1
+    `).get();
+    if (dup !== undefined) {
+      logWrite('WARN', `${tableName}.${columnName} 存在重复值「${dup.v}」，已跳过唯一索引 ${indexName}，请人工清理后重启`);
+      return;
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ${indexName} ON ${tableName}(${columnName})`);
+  } catch (err) {
+    logWrite('WARN', `创建唯一索引 ${indexName} 失败: ${err && err.message}`);
+  }
 }
 
 // 产品基础表（老库缺失时自动补齐，热成像记录通过 product_id 关联本表）
@@ -3195,31 +4872,20 @@ function ensureRecipeSchema() {
     logWrite('MIGRATE', `配方产品关联回填：${matched}/${pending.length} 条按产品名称匹配到产品档案`);
   }
 
-  // 历史数据修复：早期初始化脚本把 mold_recipes.mold_id 硬编码为 1..n，
-  // 而 molds 表重新灌数后自增 id 已变化，导致模具引用悬空（配方查不到模具名称）。
-  // 这里按「模具档案 id 升序」重建序号映射，仅修复指向不存在模具的记录。
-  const dangling = db.prepare(`
-    SELECT id, mold_id FROM mold_recipes
+  // 历史数据修复：早期初始化脚本把 mold_id 硬编码为 1..n，molds 重新灌数后可能悬空。
+  // 不能按「id 升序」猜测重映射（会把配方错误绑定到别的模具），统一置空并提示人工确认。
+  const cleared = db.prepare(`
+    UPDATE mold_recipes
+    SET mold_id = NULL, updated_at = datetime('now','localtime')
     WHERE mold_id IS NOT NULL AND mold_id > 0
       AND NOT EXISTS (SELECT 1 FROM molds m WHERE m.id = mold_recipes.mold_id)
-    ORDER BY id
-  `).all();
-  if (dangling.length) {
-    const moldIds = db.prepare('SELECT id FROM molds ORDER BY id').all().map((row) => row.id);
-    const fixMold = db.prepare('UPDATE mold_recipes SET mold_id = ? WHERE id = ?');
-    let fixed = 0;
-    db.transaction(() => {
-      dangling.forEach((row) => {
-        const target = moldIds[Number(row.mold_id) - 1];
-        if (!target) return;
-        fixMold.run(target, row.id);
-        fixed += 1;
-      });
-    })();
-    logWrite('MIGRATE', `配方模具关联修复：${fixed}/${dangling.length} 条悬空 mold_id 已按模具档案顺序重映射`);
+  `).run().changes;
+  if (cleared) {
+    logWrite('MIGRATE', `配方模具关联修复：${cleared} 条悬空 mold_id 已置空，请在「模具配方」中重新选择模具`);
   }
 
   db.exec('CREATE INDEX IF NOT EXISTS idx_recipe_product_id ON mold_recipes(product_id)');
+  ensureUniqueIndexSafely('molds', 'mold_name', 'uq_molds_name');
 }
 
 // 清理历史遗留表：process_standards 已被分析标准版本表
@@ -3237,7 +4903,69 @@ function dropLegacyTables() {
   logWrite('MIGRATE', `已删除未使用表 process_standards（原 ${removed} 条记录，工艺标准统一由 analysis_standards 维护）`);
 }
 
+// 用户与会话表：登录账号、页面授权（JSON 数组）、按钮动作授权
+function ensureUserSchema() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      display_name TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'normal',
+      display_pages TEXT NOT NULL DEFAULT '[]',
+      admin_pages TEXT NOT NULL DEFAULT '[]',
+      actions TEXT NOT NULL DEFAULT '[]',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      last_login_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    );
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen TEXT,
+      ip TEXT DEFAULT '',
+      user_agent TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_exp ON user_sessions(expires_at);
+  `);
+
+  const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+  if (!count) {
+    // 未显式配置时使用一次性随机密码，杜绝 admin/123456 这类默认弱口令
+    const configuredOk = CONFIGURED_ADMIN_PASSWORD && isValidPasswordLength(CONFIGURED_ADMIN_PASSWORD);
+    if (CONFIGURED_ADMIN_PASSWORD && !configuredOk) {
+      logWrite('ERROR', `DEFAULT_ADMIN_PASSWORD 长度需在 ${PASSWORD_MIN_LENGTH} ~ ${PASSWORD_MAX_LENGTH} 位之间，已改用随机密码`);
+    }
+    const initialPassword = configuredOk
+      ? CONFIGURED_ADMIN_PASSWORD
+      : crypto.randomBytes(12).toString('base64url');
+    db.prepare(`
+      INSERT INTO users (username, display_name, password_hash, role, display_pages, admin_pages, actions)
+      VALUES (?, ?, ?, 'super', ?, ?, '[]')
+    `).run(
+      DEFAULT_ADMIN_USER,
+      '超级管理员',
+      hashPasswordSync(initialPassword),
+      JSON.stringify(DISPLAY_PAGE_KEYS),
+      JSON.stringify(ADMIN_PAGE_KEYS)
+    );
+    if (configuredOk) {
+      logWrite('SYSTEM', `已创建初始超级管理员 ${DEFAULT_ADMIN_USER}（密码取自 DEFAULT_ADMIN_PASSWORD），请登录后修改密码`);
+    } else {
+      // 随机密码只在此处输出一次，不写入日志文件
+      console.log(`[INIT] 初始超级管理员账号：${DEFAULT_ADMIN_USER}`);
+      console.log(`[INIT] 随机初始密码（仅显示一次，请立即登录后修改）：${initialPassword}`);
+      logWrite('SYSTEM', `已创建初始超级管理员 ${DEFAULT_ADMIN_USER}（随机密码，仅控制台输出一次）`);
+    }
+  }
+}
+
 function ensureSchema() {
+  ensureUserSchema();
   ensureDeviceCodes();
   ensurePlanSchema();
   ensureProductSchema();
@@ -3461,15 +5189,20 @@ function ensureSchema() {
 ensureSchema();
 
 // 复合索引补齐（老库升级后同样生效，减少聚合与计划进度查询的回表扫描）
+// 新库尚未执行 init_all.sql 时相关表不存在，按表存在性跳过，避免启动告警
 function ensureIndexes() {
   const statements = [
-    'CREATE INDEX IF NOT EXISTS idx_process_device_time ON process_data (device_code, collect_time DESC)',
-    'CREATE INDEX IF NOT EXISTS idx_process_time_status ON process_data (collect_time, data_status)',
-    'CREATE INDEX IF NOT EXISTS idx_stats_date_device ON production_stats (stat_date, device_code)',
-    'CREATE INDEX IF NOT EXISTS idx_plans_start_device ON production_plans (start_time, device_code)',
+    ['process_data', 'CREATE INDEX IF NOT EXISTS idx_process_device_time ON process_data (device_code, collect_time DESC)'],
+    ['process_data', 'CREATE INDEX IF NOT EXISTS idx_process_time_status ON process_data (collect_time, data_status)'],
+    ['production_stats', 'CREATE INDEX IF NOT EXISTS idx_stats_date_device ON production_stats (stat_date, device_code)'],
+    ['production_plans', 'CREATE INDEX IF NOT EXISTS idx_plans_start_device ON production_plans (start_time, device_code)'],
   ];
   try {
-    const tx = db.transaction(() => statements.forEach((sql) => db.exec(sql)));
+    const tx = db.transaction(() => {
+      for (const [table, sql] of statements) {
+        if (tableExists(table)) db.exec(sql);
+      }
+    });
     tx();
   } catch (err) {
     logWrite('WARN', `索引补齐失败: ${err && err.message}`);
@@ -3490,6 +5223,53 @@ function checkpointWal() {
 checkpointWal();
 setInterval(checkpointWal, 60 * 60 * 1000).unref();
 
+// 清理过期登录会话（每小时 + 启动时）
+function pruneSessions() {
+  try {
+    if (!tableExists('user_sessions')) return;
+    const changes = db.prepare('DELETE FROM user_sessions WHERE expires_at <= ?').run(stampNow()).changes;
+    if (changes) logWrite('CLEANUP', `清理过期登录会话 ${changes} 条`);
+  } catch (err) {
+    logWrite('WARN', `会话清理失败: ${err && err.message}`);
+  }
+}
+
+pruneSessions();
+setInterval(pruneSessions, 60 * 60 * 1000).unref();
+
+// 历史数据保留（可选）：HISTORY_RETENTION_DAYS > 0 时清理日志 / 呼叫 / 统计派生表
+//   只清理纯日志与可再生成的派生数据，不影响工艺数据、设备档案、配方与计划主表
+function pruneHistory() {
+  if (!HISTORY_RETENTION_DAYS) return;
+  const cutoffDate = addDays(formatDateStr(new Date()), -HISTORY_RETENTION_DAYS);
+  if (!cutoffDate) return;
+  const cutoffTime = `${cutoffDate} 00:00:00`;
+  // 注意：analysis_standard_logs 同时承载用户/权限/标准变更审计，属不可篡改留痕，
+  // 不纳入自动清理；如需归档请走人工审批的导出流程。
+  const jobs = [
+    ['production_plan_logs', 'operate_time', cutoffTime],
+    ['andon_call_logs', 'operate_time', cutoffTime],
+    ['andon_calls', 'call_time', cutoffTime],
+    ['device_status_history', 'start_time', cutoffTime],
+    ['production_stats', 'stat_date', cutoffDate],
+  ];
+  try {
+    const tx = db.transaction(() => {
+      for (const [table, column, cutoff] of jobs) {
+        if (!tableExists(table)) continue;
+        const changes = db.prepare(`DELETE FROM ${table} WHERE ${column} < ?`).run(cutoff).changes;
+        if (changes) logWrite('CLEANUP', `清理 ${table} 中早于 ${cutoff} 的 ${changes} 条历史数据`);
+      }
+    });
+    tx();
+  } catch (err) {
+    logWrite('WARN', `历史数据清理失败: ${err && err.message}`);
+  }
+}
+
+pruneHistory();
+setInterval(pruneHistory, 24 * 60 * 60 * 1000).unref();
+
 // 兜底：未捕获异常只记录、不退出进程，避免单个请求异常导致服务整体中断
 process.on('uncaughtException', (err) => {
   logWrite('ERROR', `未捕获异常: ${err && err.stack ? err.stack : err}`);
@@ -3500,5 +5280,5 @@ process.on('unhandledRejection', (err) => {
 
 server.listen(PORT, () => {
   console.log(`✅ MES Monitor API 服务已启动: http://localhost:${PORT}`);
-  console.log(`📊 数据库: ${path.join(__dirname, 'mesmonitor.db')}`);
+  console.log(`📊 数据库: ${DB_PATH}`);
 });

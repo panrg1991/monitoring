@@ -40,7 +40,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
-import { apiGet } from '../../shared/api';
+import { apiGet, escapeHtml } from '../../shared/api';
 
 const props = defineProps({
   active: { type: Boolean, default: false },
@@ -127,7 +127,8 @@ const thermalImageSvg = computed(() => {
     const x = c * cellW;
     const y = r * cellH;
     const cx = x + cellW / 2;
-    const name = String(p.point_name || `点位${i + 1}`);
+    // 点位名称来自数据库，拼进 SVG（v-html）前必须转义，防止存储型 XSS
+    const name = escapeHtml(String(p.point_name || `点位${i + 1}`));
     const label = valid ? `${temp.toFixed(0)}°C` : '--';
     cells += `<g><rect x="${x}" y="${y}" width="${cellW}" height="${cellH}" fill="${color}" opacity="0.92"><title>${name}: ${label}</title></rect>`
       + `<text x="${cx}" y="${y + cellH * 0.42}" fill="${textColor}" font-size="${nameSize}" text-anchor="middle" font-family="Microsoft YaHei,Arial" opacity="0.85">${name}</text>`

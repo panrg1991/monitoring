@@ -442,8 +442,16 @@ CREATE TABLE production_plans (
     plan_count      INTEGER NOT NULL,             -- 计划生产数
     start_time      TEXT    NOT NULL,             -- 计划开始时间 YYYY-MM-DD HH:MM:SS
     end_time        TEXT    NOT NULL,             -- 计划结束时间
-    status          TEXT    NOT NULL DEFAULT 'running',  -- running / completed / cancelled
-    completed_at    TEXT,                         -- 结束(或取消)时间
+    -- 状态流转: draft(起草) → issued(已下达) → running(执行中) ⇄ paused(暂停) → completed(已完成) → closed(已结案)
+    --           draft/issued/running/paused → cancelled(已取消); cancelled → draft(恢复起草)
+    status          TEXT    NOT NULL DEFAULT 'draft',
+    issued_at       TEXT,                         -- 下达(派发生效)时间
+    started_at      TEXT,                         -- 首次开始执行时间
+    paused_at       TEXT,                         -- 最近一次暂停时间
+    pause_reason    TEXT,                         -- 暂停原因
+    completed_at    TEXT,                         -- 完成时间
+    closed_at       TEXT,                         -- 结案时间
+    cancelled_at    TEXT,                         -- 取消时间
     remark          TEXT,
     created_at      TEXT    DEFAULT (datetime('now','localtime')),
     updated_at      TEXT    DEFAULT (datetime('now','localtime'))
@@ -453,6 +461,33 @@ CREATE TABLE production_plans (
 CREATE INDEX IF NOT EXISTS idx_plan_device ON production_plans(device_code);
 CREATE INDEX IF NOT EXISTS idx_plan_time   ON production_plans(start_time, end_time);
 CREATE INDEX IF NOT EXISTS idx_plan_status ON production_plans(status);
+
+-- 生产计划状态流转日志
+DROP TABLE IF EXISTS production_plan_logs;
+CREATE TABLE production_plan_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id      INTEGER NOT NULL,             -- 计划 id（计划删除后日志保留，故不建外键）
+    plan_code    TEXT,                         -- 计划编号快照
+    action       TEXT    NOT NULL,             -- create/update/issue/start/pause/resume/complete/close/cancel/revert/delete
+    from_status  TEXT,
+    to_status    TEXT,
+    operator     TEXT,
+    remark       TEXT,
+    operate_time TEXT    DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_plan_log_plan ON production_plan_logs(plan_id, operate_time DESC);
+
+-- 生产计划执行段：记录每次「开始执行 → 暂停/完成/取消」的时间区间
+-- 计划完成数 = 各执行区间内该设备的工艺记录数之和，暂停期间产出的其他计划不会被计入
+DROP TABLE IF EXISTS production_plan_segments;
+CREATE TABLE production_plan_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id    INTEGER NOT NULL,
+    started_at TEXT    NOT NULL,             -- 本次开始执行时间
+    ended_at   TEXT,                          -- 本次结束时间（暂停 / 完成 / 取消），空 = 执行中
+    created_at TEXT    DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_plan_seg_plan ON production_plan_segments(plan_id, started_at);
 
 
 -- ============================================================
@@ -476,6 +511,8 @@ DELETE FROM andon_call_types;
 DELETE FROM production_stats;
 DELETE FROM shift_config;
 DELETE FROM production_plans;
+DELETE FROM production_plan_logs;
+DELETE FROM production_plan_segments;
 DELETE FROM process_data;
 DELETE FROM analysis_standard_logs;
 DELETE FROM analysis_standards;

@@ -3,7 +3,7 @@
     <div class="dashboard-header">
       <h1 class="dashboard-title">{{ isAdmin ? '模具配方管理' : '模具配方' }}</h1>
       <div class="header-actions">
-        <button v-if="isAdmin" class="refresh-btn" @click="openCreate">+ 新增配方</button>
+        <button v-if="isAdmin && can('recipe', 'create')" class="refresh-btn" @click="openCreate">+ 新增配方</button>
       </div>
     </div>
 
@@ -145,9 +145,9 @@
                 </td>
                 <td class="time-cell group-start">{{ r.updated_at || r.created_at || '--' }}</td>
                 <td class="group-start">
-                  <template v-if="isAdmin">
-                    <button class="link-btn" @click="openEdit(r)">编辑</button>
-                    <button class="link-btn danger" @click="askDelete(r)">删除</button>
+                  <template v-if="isAdmin && (can('recipe', 'update') || can('recipe', 'delete'))">
+                    <button v-if="can('recipe', 'update')" class="link-btn" @click="openEdit(r)">编辑</button>
+                    <button v-if="can('recipe', 'delete')" class="link-btn danger" @click="askDelete(r)">删除</button>
                   </template>
                   <span v-else class="sub-text">--</span>
                 </td>
@@ -217,6 +217,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import { apiGet, apiPost, buildPageList } from '../api';
+import { can } from '../auth';
 import { loadPageState, savePageState } from '../usePageState';
 import HScrollBar from '../HScrollBar.vue';
 import RecipeEditDialog from './RecipeEditDialog.vue';

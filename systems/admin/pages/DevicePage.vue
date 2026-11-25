@@ -3,7 +3,7 @@
     <div class="dashboard-header">
       <h1 class="dashboard-title">设备管理</h1>
       <div class="header-actions">
-        <button class="refresh-btn" @click="openCreate">+ 新增设备</button>
+        <button v-if="can('device', 'create')" class="refresh-btn" @click="openCreate">+ 新增设备</button>
       </div>
     </div>
 
@@ -110,8 +110,8 @@
                   </span>
                 </td>
                 <td>
-                  <button class="link-btn" @click="openEdit(d)">编辑</button>
-                  <button class="link-btn danger" @click="askDelete(d)">删除</button>
+                  <button v-if="can('device', 'update')" class="link-btn" @click="openEdit(d)">编辑</button>
+                  <button v-if="can('device', 'delete')" class="link-btn danger" @click="askDelete(d)">删除</button>
                 </td>
               </tr>
               <tr v-if="!devices.length">
@@ -146,6 +146,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue';
 import { apiGet, apiPost, escapeHtml } from '../../shared/api';
+import { can } from '../../shared/auth';
 import DeviceEditDialog from './DeviceEditDialog.vue';
 import AppDialog from '../../shared/AppDialog.vue';
 

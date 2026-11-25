@@ -80,10 +80,18 @@
 
 ### 11. 生产计划
 - 按设备下达计划（`production_plans`）：计划编号、名称、设备、产品型号（可选）、计划数、计划周期
-- **完成度实时统计**：完成数 = 该设备在计划周期内 `process_data` 的工艺记录数，每次查询实时聚合，无需重算任务
+- **完整状态流转**：起草 → 下达（派发生效）→ 执行中 ⇄ 暂停 → 完成 → 结案；起草 / 已下达 / 执行中 / 暂停可取消，已取消可恢复为起草
+- **状态约束**：起草状态可修改全部字段；已下达后仅可改名称与备注（排产要素锁定，需先「撤回」为起草）；已完成仅可结案；仅起草 / 已取消的计划可删除
+- **开始执行与完成可回填实际时间**：点「开始」「完成」时弹窗默认当前时间，可改成实际发生时间（如月初生产、月中才补确认），完成数按回填区间统计，多个计划各自独立不串数据；暂停 / 恢复 / 取消仍按实际切换时间记录，保证暂停区间真实
+- **回填时间受计划周期约束**：`occurred_at` 必须是有效日历时间（`YYYY-MM-DD HH:MM`），不得晚于当前时间、不得早于计划开始时间；开始执行时若已过计划结束时间，需先撤回为起草并调整计划周期，避免出现「设备被占用但完成数为 0」
+- **同设备执行区间不重叠**：开始 / 恢复执行时校验该设备已有计划的执行段，若时间区间重叠则拒绝并提示占用计划（编号、区间）；不同设备的计划可同时执行。计划暂停 / 完成后释放设备，其他计划即可开始
+- **暂停必须填写原因**，用于异常情况追溯；每次流转写入 `production_plan_logs`（操作人、时间、原因），编辑弹窗内可查看流转记录
+- **完成度按执行段累计**：完成数 = 各「执行段」（`production_plan_segments`，即每次开始执行→暂停/完成/取消 的时间区间）内该设备的工艺记录数之和；暂停期间设备生产其他计划的产出不计入本计划，恢复后从当前时间继续累计，因此「计划数 500 → 已做 100 → 暂停 → 恢复 → 再做 50」累计为 150
+- 未开始执行（起草 / 已下达）的计划完成数为 0；撤回或恢复起草会清空执行段
 - 指定产品型号时只统计该产品；未启用设备的记录不参与统计（与生产统计口径一致）
-- 计划状态：进行中 / 已完成 / 已取消，结束或取消时记录操作时间；进行中超期自动标记「已超期」
-- 页面每 15 秒自动刷新进行中计划的进度，也可手动暂停；支持设备 / 状态 / 关键字 / 日期范围筛选
+- 已下达 / 执行中 / 暂停的计划超过结束时间自动标记「已超期」/「逾期未执行」，各状态数量在汇总卡片中分别展示
+- 页面每 15 秒自动刷新计划状态与进度；支持设备 / 状态 / 关键字 / 日期范围筛选
+- 每个计划提供「查询」按钮，弹窗按分页列出该计划关联的工艺记录（与完成数同口径：设备 + 周期 ∩ 执行段 + 产品），并列展示全部工艺参数，便于核对完成数来源
 - 分页每页条数可选 10 / 20 / 50 / 100（默认 10）；支持导出 CSV，未设置日期范围时导出最近一个月
 
 ### 12. 工艺参数曲线
@@ -102,11 +110,60 @@
 | 系统 | 访问地址 | 定位 | 包含模块 |
 |---|---|---|---|
 | 前端显示系统 | `/` | 车间看板，只读展示 | 首页、热成像、管路控制（参数显示）、模具配方（查看）、安灯呼叫（呼叫看板）、工艺数据、工艺参数曲线、生产统计、生产计划（进度） |
-| 后端管理系统 | `/admin` | 管理后台，配置与运维 | 设备管理、产品管理、模具档案、模具配方、管路参数下发、安灯呼叫处理、数据分析、工艺参数曲线、生产统计（班次设置 / 重新统计）、生产计划（新增 / 编辑 / 结束 / 删除） |
+| 后端管理系统 | `/admin` | 管理后台，配置与运维 | 设备管理、产品管理、模具档案、模具配方、管路参数下发、安灯呼叫处理、数据分析、工艺参数曲线、生产统计（班次设置 / 重新统计）、生产计划（起草 / 下达 / 暂停 / 完成 / 结案） |
 
 - 两套系统各自维护导航与 URL hash，刷新后都停留在当前模块；
 - 管路、安灯、统计、计划四个页面为双端共用组件，通过 `viewMode="display|admin"` 隐藏或显示管理操作，避免维护两份页面；
 - 两个入口共用同一份构建产物与全局样式，`server.js` 按路径分配入口：`/` → `index.html`，`/admin` → `admin.html`。
+
+## 登录与权限控制
+
+系统内置账号体系，按「页面可见性 + 按钮动作」两级授权，权限在**后端强制校验**，不是仅隐藏前端按钮。
+
+### 账号与登录
+
+- 初始超级管理员：用户名由 `DEFAULT_ADMIN_USER` 指定（默认 `admin`）。**密码不再有内置默认值**：未配置 `DEFAULT_ADMIN_PASSWORD` 时，首次建库随机生成 16 位密码并只在控制台输出一次，请立即登录修改；配置了该变量则使用配置值（长度 6~128）
+- 登录接口下发 `HttpOnly + SameSite=Lax` 会话 Cookie（`mes_session`），令牌不写入 `localStorage`；会话默认 12 小时，活跃时自动续期；HTTPS 部署请设置 `COOKIE_SECURE=1` 追加 `Secure`
+- 连续输错密码达到阈值（默认 5 次）按「IP + 用户名」锁定 60 秒，返回 429；默认只信任直连 IP，`X-Forwarded-For` 需显式开启 `TRUST_PROXY=1` 才解析，避免伪造 IP 绕过锁定
+- 修改密码后该账号其它终端会话立即失效；停用 / 删除用户会清理其全部会话
+
+### 未登录可见内容
+
+- 车间看板 `/`：只展示「首页」看板内容（设备概览 + 报警详情）与「登录」按钮，其它看板页签隐藏
+- 管理后台 `/admin`：直接展示整页登录框，未登录无法进入任何配置页面
+- 接口侧仅放行 `/health`、`/api/auth/*`、`/api/devices/overview`、`/api/devices/alarm-log`，其余接口一律 401
+
+### 授权模型
+
+| 层级 | 说明 | 作用点 |
+|---|---|---|
+| 车间看板页面 | 该账号能看到的显示端页签（首页 / 热成像 / 管路 / 配方 / 安灯 / 工艺 / 曲线 / 统计 / 计划） | 显示端导航与页面渲染；对应模块的读接口 |
+| 后台管理页面 | 该账号能进入的后台页签（设备 / 产品 / 模具 / 配方 / 管路 / 安灯 / 分析 / 曲线 / 统计 / 计划 / 用户权限） | 后台导航与页面渲染；对应模块的读接口 |
+| 按钮动作 | 新增 / 修改 / 删除等写操作，按模块勾选（如 `device:create`、`plan:operate`、`stats:config`、`andon:respond`） | 后台与看板的操作按钮；后端写接口，越权返回 403 |
+
+- 超级管理员（`role = super`）自动拥有全部页面与动作，不参与勾选
+- 非超级管理员即使拥有「用户权限」页，也不能把超管身份或「用户权限」模块授出，无法修改 / 删除超管账号
+- 仅拥有 `display: plan` 而不具备 `plan:operate` 的账号可在看板查看计划进度但不能开始 / 暂停 / 完成
+
+**按钮权限与页面强关联**：动作权限依附于所属模块页面，未分配该模块页面时，其下的新增 / 删除等动作不生效。
+
+- 授权界面：取消某模块页面后，该模块的动作组变灰并提示「需先勾选该页面」，已勾选的动作自动取消后保存
+- 接口侧：保存时自动丢弃「无页面却有动作」的组合，读取用户信息时同样收敛；写接口会先校验是否拥有该模块页面，没有则返回 403
+- 模块页面任一端（看板或后台）拥有即可承载该模块动作，例如「安灯呼叫」看板页可承载 `andon:create`、`andon:respond`
+
+### 用户管理
+
+进入「后台 → 用户权限」可完成：新增账号、修改显示名称、重置密码、启用 / 停用、删除，以及逐项勾选看板页面、后台页面与按钮动作。同一页面内的「编辑 / 重置密码 / 删除」按钮本身也受 `user:update` / `user:delete` 控制。
+
+### 退出登录
+
+点击「退出」后回到初始界面：直接展示车间看板首页（未登录状态），地址栏不保留上一个模块的 hash；在后台退出则跳转回 `/`，不再停留在后台登录页。
+
+### 机器令牌（自动化脚本）
+
+若配置了 `ADMIN_TOKEN`，服务端脚本（如 `stats_job.js`）可携带 `X-Admin-Token` 调用接口（等同超级管理员），用于定时统计、采集写入等无人值守任务。
+
+**浏览器端不支持该令牌**：`/admin?token=xxx` 不再写入或携带 `X-Admin-Token`。机器令牌等同超级管理员，一旦进入 `localStorage` 会被 XSS 或共享大屏终端窃取并绕过全部页面/按钮权限与审计，仅限受控脚本通过环境变量使用。
 
 ## 技术栈
 
@@ -176,7 +233,7 @@ mesmonitor/
 | 工艺数据 | `process_data` | 工艺采集数据（全系统唯一数据源） |
 | 工件分析 | `analysis_standard_versions` / `analysis_standards` / `analysis_standard_logs` | 分析标准版本（按时间段生效）、标准明细、变更日志 |
 | 生产统计 | `shift_config` / `production_stats` | 班次配置（可为空，空=按天）、日期+班次+设备产量统计 |
-| 生产计划 | `production_plans` | 设备计划数与周期，完成度实时取自 `process_data` |
+| 生产计划 | `production_plans` / `production_plan_logs` / `production_plan_segments` | 计划数、周期与状态流转时间戳；流转日志留痕；执行段决定完成数统计区间 |
 
 > `andon_call_logs`（安灯操作日志）关联 `andon_calls` 外键，记录发起 / 响应 / 完成 / 取消等操作，含操作人、操作内容与时间。
 
@@ -204,7 +261,11 @@ mesmonitor/
 | `analysis_standard_logs` | 分析标准变更日志表 | 标准版本与参数的新增 / 修改 / 删除操作留痕 |
 | `shift_config` | 班次配置表 | 班次编码、名称与起止时间（表可为空，空 = 按天统计） |
 | `production_stats` | 生产统计表 | 按「日期 + 班次 + 设备」汇总的生产数、合格数、预警数、不合格数 |
-| `production_plans` | 生产计划表 | 计划编号 / 名称、设备编号、产品型号、计划数、计划周期与状态 |
+| `production_plans` | 生产计划表 | 计划编号 / 名称、设备编号、产品型号、计划数、计划周期、状态及下达 / 开始 / 暂停 / 完成 / 结案 / 取消时间戳与暂停原因 |
+| `production_plan_logs` | 生产计划流转日志表 | 计划每次创建、修改、下达、开始、暂停、恢复、完成、结案、取消、删除的操作人、前后状态、原因与时间 |
+| `production_plan_segments` | 计划执行段表 | 每次「开始执行 → 暂停 / 完成 / 取消」的时间区间，完成数只统计落在这些区间内的工艺记录 |
+| `users` | 登录账号表 | 用户名（唯一）、显示名称、scrypt 密码哈希、角色（`super` / `normal`）、看板页面 / 后台页面 / 按钮动作授权（JSON 数组）、启用状态与最近登录时间 |
+| `user_sessions` | 登录会话表 | 会话令牌（64 位随机串）、所属用户、创建 / 过期时间、IP 与 User-Agent；过期由服务每小时清理 |
 
 > **数据来源说明**：历史工件分析模块**不再单独存业务数据**，全部取自 `process_data`；该表新增 `workpiece_no`（工件编号）作为分析标识。分析标准只描述"用哪些参数、按什么标准值判定"，其中 `analysis_standards.param_key` 必须是 `process_data` 中存在的工艺参数列，从而保证"分析要用的参数，工艺数据表一定包含"。
 >
@@ -224,7 +285,16 @@ mesmonitor/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/devices/overview` | 设备概览（统计 + 状态卡片，仅启用设备） |
+| POST | `/api/auth/login` | 登录（body：`username`/`password`），成功下发 `mes_session` Cookie |
+| POST | `/api/auth/logout` | 退出登录（清理会话与 Cookie） |
+| GET | `/api/auth/me` | 当前登录用户与权限目录；未登录返回 `user: null` |
+| GET | `/api/auth/meta` | 看板页面 / 后台页面 / 按钮动作目录（需登录） |
+| POST | `/api/auth/password` | 修改自己的密码（body：`old_password`/`new_password`） |
+| GET | `/api/auth/users` | 用户列表（需「用户权限」页面） |
+| POST | `/api/auth/users/create` | 新增用户（`username`/`password`/`display_pages`/`admin_pages`/`actions`） |
+| POST | `/api/auth/users/update` | 修改用户 / 重置密码 / 重新授权（body：`id` + 可改字段） |
+| POST | `/api/auth/users/delete` | 删除用户（不能删除自己与最后一个超级管理员） |
+| GET | `/api/devices/overview` | 设备概览（统计 + 状态卡片，仅启用设备；未登录可读） |
 | GET | `/api/devices/alarm-log?name=` | 按设备名称查询报警历史 |
 | GET | `/api/devices/list?keyword=&type=&active=` | 设备列表（含最新状态、关联工艺数据条数、统计与类型） |
 | GET | `/api/devices/options` | 设备编号下拉选项（各页面筛选项数据来源） |
@@ -278,19 +348,24 @@ mesmonitor/
 | GET | `/api/stats/export?startDate=&endDate=&device=&shift=` | 生产统计导出 CSV（填日期则导出该区间，否则默认最近一个月） |
 | POST | `/api/stats/rebuild` | 重新统计（body：`startDate`/`endDate` 按区间重算，默认昨天+今天；`all: true` 时清空统计表并按 `process_data` 全部记录全量重建；仅统计已启用设备，返回 `skippedRecords`/`inactiveDevices`） |
 | GET | `/api/stats/shifts` | 班次配置列表与当前统计模式（day / shift） |
-| POST | `/api/stats/shifts/create` | 新增班次（body：`shift_name`/`shift_code`/`start_time`/`end_time`） |
-| POST | `/api/stats/shifts/update` | 修改班次（body：`id` + 可改字段，含 `is_active`） |
-| POST | `/api/stats/shifts/delete` | 删除班次（body：`id`） |
+| POST | `/api/stats/shifts/create` | 新增班次（body：`shift_name`/`shift_code`/`start_time`/`end_time`；启用班次之间不允许时间重叠） |
+| POST | `/api/stats/shifts/update` | 修改班次（body：`id` + 可改字段，含 `is_active`；`sort_order` 必须为整数，班次时间不允许与其它启用班次重叠） |
+| POST | `/api/stats/shifts/delete` | 删除班次（body：`id`；已被生产统计引用时返回 400，确认删除需传 `force: true`） |
 | POST | `/api/stats/shifts/init` | 一键生成标准班次（白班 08:00-20:00 / 夜班 20:00-08:00） |
 | GET | `/api/plans/list?keyword=&device=&status=&startDate=&endDate=&page=&pageSize=` | 生产计划列表（含实时完成数、完成率与汇总） |
 | GET | `/api/plans/export?keyword=&device=&status=&startDate=&endDate=` | 生产计划导出 CSV（按计划开始时间过滤，否则默认最近一个月） |
 | GET | `/api/plans/options` | 计划表单可选设备（仅启用）与产品型号 |
-| POST | `/api/plans/create` | 新增计划（body：`device_code`/`plan_count`/`start_time`/`end_time`，可选 `plan_code`/`plan_name`/`product_model`/`remark`） |
-| POST | `/api/plans/update` | 修改计划（body：`id` + 可改字段） |
-| POST | `/api/plans/status` | 结束 / 取消 / 恢复计划（body：`id`、`status` = running / completed / cancelled） |
-| POST | `/api/plans/delete` | 删除计划（body：`id`） |
+| POST | `/api/plans/create` | 新增计划（body：`device_code`/`plan_count`/`start_time`/`end_time`，可选 `plan_code`/`plan_name`/`product_model`/`remark`；创建后状态为 `draft` 起草） |
+| POST | `/api/plans/update` | 修改计划（body：`id` + 可改字段；起草可改全部，已下达/执行中/暂停仅可改 `plan_name`/`remark`） |
+| POST | `/api/plans/status` | 计划状态流转（body：`id`、`status` = issued / running / paused / completed / closed / cancelled / draft；暂停需传 `remark`；`running`（首次开始）与 `completed` 可传 `occurred_at` 回填实际时间，格式 `YYYY-MM-DD HH:MM`，须为有效日期且位于计划周期内、不晚于当前时间；同一设备执行区间重叠时返回 400 并提示占用计划） |
+| POST | `/api/plans/delete` | 删除计划（body：`id`；仅 `draft` / `cancelled` 可删除） |
+| GET | `/api/plans/logs?id=&limit=` | 计划状态流转记录（`id` 为空返回全部，`limit` 默认 100、最大 500） |
+| GET | `/api/plans/records?id=&page=&pageSize=` | 计划关联的工艺数据（与完成数同口径，返回分页记录 + 工艺参数清单 + 计划概要，`pageSize` 默认 20、最大 100） |
 
-> 所有接口响应为 JSON。POST 接口需 `Content-Type: application/json` 请求体。参数缺失或状态不合法时返回对应错误码（400/404/401/413）。
+> 所有接口响应为 JSON。POST 接口需 `Content-Type: application/json` 请求体。
+> 错误码约定：参数缺失 / 格式非法 / 状态不合法 → 400；资源不存在 → 404；未授权 → 401；请求体超限 → 413；
+> 未注册的 `/api/*` 路径 → 404 JSON（不再回退为页面）；路径存在但方法不匹配 → 405 并带 `Allow` 头。
+> 时间 / 日期类查询参数（`startTime`/`endTime`/`startDate`/`endDate`）会做日历校验，非法值直接返回 400，不再静默返回空结果。
 
 ## 环境变量与安全配置
 
@@ -301,18 +376,31 @@ mesmonitor/
 | `PORT` | `3456` | 监听端口 |
 | `DB_PATH` | `./mesmonitor.db` | 数据库文件路径 |
 | `LOG_FILE` | `./server.log` | 日志文件路径 |
-| `ADMIN_TOKEN` | 空（不启用） | 设置后所有 POST 接口必须携带 `X-Admin-Token`，否则返回 401 |
+| `ADMIN_TOKEN` | 空（不启用） | 机器令牌：**仅服务端脚本**携带 `X-Admin-Token` 时等同超级管理员；浏览器端已不支持 |
+| `SESSION_TTL_HOURS` | `12` | 登录会话有效期（小时），活跃访问自动续期 |
+| `DEFAULT_ADMIN_USER` | `admin` | 首次启动创建的超级管理员用户名（仅在 users 表为空时生效） |
+| `DEFAULT_ADMIN_PASSWORD` | 空（随机生成） | 初始超管密码，长度 6~128；为空时随机生成并只在控制台输出一次 |
+| `COOKIE_SECURE` | `0` | 置 `1` 时会话 Cookie 追加 `Secure`，HTTPS 部署必须开启 |
+| `TRUST_PROXY` | `0` | 置 `1` 时才解析 `X-Forwarded-For`（仅在可信反向代理之后开启，否则可被伪造绕过登录锁定） |
+| `LOGIN_MAX_FAILS` | `5` | 同一 IP + 用户名连续登录失败多少次后锁定 |
+| `LOGIN_LOCK_SECONDS` | `60` | 登录失败锁定时长（秒） |
+| `LOGIN_MAX_CONCURRENT` | `8` | 同时进行的登录校验上限，超出返回 429（scrypt 校验异步执行，避免占满 CPU） |
 | `CORS_ORIGIN` | 空（不开放跨域） | 逗号分隔的来源白名单，仅对匹配来源下发 CORS 头 |
-| `MAX_BODY_BYTES` | `1048576` | 请求体大小上限，超出返回 413 |
+| `MAX_BODY_BYTES` | `1048576` | 请求体大小上限，超出返回 413（低于 1024 时取默认值） |
 | `LOG_MAX_BYTES` | `5242880` | 日志文件上限，超出后轮转为 `server.log.1` |
+| `HISTORY_RETENTION_DAYS` | `0`（不清理） | 大于 0 时每天清理早于该天数的流转日志、安灯记录、状态历史与统计派生表（工艺数据 / 计划主表 / 审计日志不受影响） |
+| `ANALYSIS_MAX_SCAN` | `20000` | 分析列表单次判定的最大扫描行数，调大可覆盖更多历史但会延长单次请求耗时 |
+| `DEVICE_CODE_SYNC_MAX_ROWS` | `20000` | 修改设备编号时允许同步的最大工艺数据条数，超出则拒绝并要求迁移 |
 
-启用鉴权后，前端首次访问带一次令牌即可（会自动写入 localStorage 并从地址栏清除）：
+登录后浏览器持有会话 Cookie；自动化脚本使用 `ADMIN_TOKEN` 时直接带请求头即可：
 
 ```
-http://<服务器>/admin?token=<你的令牌>
+X-Admin-Token: <你的令牌>
 ```
 
-写接口还会做输入收敛：`pageSize` 上限 200、非法 JSON 返回 400、错误详情只写日志不回传。
+写接口还会做输入收敛：`pageSize` 上限 200、非法 JSON 返回 400、错误详情只写日志不回传；
+日期时间做日历校验（拒绝 13 月 / 2 月 31 日 / 25 点）、数值字段拒绝 `NaN` / `Infinity`、文本字段拒绝对象与数组；
+静态资源响应带 CSP / `X-Content-Type-Options` / `X-Frame-Options`，且只从 `dist/` 提供，不暴露源码与配置文件。
 
 ### 健康检查与备份
 
@@ -332,7 +420,7 @@ http://<服务器>/admin?token=<你的令牌>
   ```
 
 - WAL 文件每小时自动 checkpoint 回主库，避免 `-wal` 长期增长。
-- CI：`.github/workflows/ci.yml` 在 push / PR 时执行语法检查、前端构建、`npm test` 与依赖审计。
+- CI：`.github/workflows/ci.yml` 在 push / PR 时执行语法检查、前端构建与依赖审计。
 
 ## 快速开始
 
@@ -371,7 +459,86 @@ npm run build
 
 > 构建产物输出到 `dist/` 目录（含 `index.html` 与 `assets/`）。若 `dist/` 不存在，`server.js` 会回退托管项目根目录的静态文件。
 
-### 5. 启动服务
+### 5. 部署到另一台服务器（需要拷贝哪些文件）
+
+生产部署时，目标服务器**不需要** `systems/`、`css/`、`index.html`、`admin.html`、`vite.config.js` 等前端源码，因为页面已经在 `dist/` 中打包完成。按下列清单拷贝即可运行。
+
+#### 方式一：只拷贝构建产物（推荐，目标机无需构建环境）
+
+| 文件 / 文件夹 | 是否必需 | 说明 |
+|---|---|---|
+| `server.js` | 必需 | Node.js 服务：API 接口 + 托管 `dist/` 静态页面 |
+| `dist/` | 必需 | `npm run build` 生成的前端产物（`index.html`、`admin.html`、`assets/`） |
+| `package.json`、`package-lock.json` | 必需 | 依赖清单，用于目标机安装运行依赖 |
+| `init_all.sql` | 新库必需 | 目标机首次部署时初始化数据库 |
+| `mesmonitor.db` | 可选 | 需要沿用现有数据时拷贝；全新环境可跳过 |
+| `stats_job.js` | 可选 | 生产统计定时任务脚本（需要按计划生成统计数据时） |
+| `deploy/` | 可选 | systemd 单元、Linux 一键部署、Windows 服务 / 计划任务脚本 |
+
+目标机执行：
+
+```bash
+npm ci --omit=dev
+node server.js
+```
+
+> `better-sqlite3` 是原生模块，**不能**把 Windows 上的 `node_modules/` 直接拷到 Linux（反之亦然），必须在目标机重新 `npm install`。
+> 全新数据库按步骤 3 的命令初始化后再启动服务。
+
+#### 方式二：拷贝源码，在目标机构建
+
+目标机已具备 Node.js 18+ 与构建环境时，可拷贝以下内容后自行构建：
+
+```
+server.js  stats_job.js  package.json  package-lock.json  init_all.sql
+index.html  admin.html  vite.config.js
+css/  systems/        （可选：deploy/）
+```
+
+目标机执行：
+
+```bash
+npm ci
+node -e "const Database=require('better-sqlite3');const fs=require('fs');const db=new Database('mesmonitor.db');db.exec(fs.readFileSync('init_all.sql','utf8'));db.close()"
+npm run build
+node server.js
+```
+
+#### 数据库迁移注意
+
+- 拷贝 `mesmonitor.db` 前先停止旧服务，避免 `-wal` / `-shm` 未合并导致数据缺失；
+- 建议用 SQLite 一致性备份后再拷贝（只拷备份文件，不拷 `-wal` / `-shm`）：
+  ```bash
+  node -e "const D=require('better-sqlite3');const db=new D('mesmonitor.db');db.backup('mesmonitor-backup.db').then(()=>{db.close();console.log('备份完成')})"
+  ```
+- 或直接执行 `init_all.sql` 初始化空库，再通过页面录入或脚本导入数据。
+  **注意**：该脚本包含 `DROP TABLE` / 全表 `DELETE`，会清空同名表数据，仅适用于全新库或演示环境，生产库严禁执行。
+
+#### 可选环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `PORT` | `3456` | 服务监听端口 |
+| `DB_PATH` | `./mesmonitor.db` | 数据库文件路径 |
+| `LOG_FILE` | `./server.log` | 运行日志路径 |
+| `ADMIN_TOKEN` | 空 | 自动化脚本令牌（等同超级管理员） |
+| `SESSION_TTL_HOURS` | `12` | 登录会话有效期（小时） |
+| `DEFAULT_ADMIN_USER` | `admin` | 默认超级管理员用户名 |
+| `DEFAULT_ADMIN_PASSWORD` | 空（随机生成） | 初始超管密码；为空时随机生成并只在控制台输出一次 |
+| `COOKIE_SECURE` | `0` | HTTPS 部署置 `1`，会话 Cookie 追加 `Secure` |
+| `TRUST_PROXY` | `0` | 仅在可信反向代理之后置 `1`，才解析 `X-Forwarded-For` |
+| `LOGIN_MAX_FAILS` | `5` | 连续登录失败锁定阈值 |
+| `LOGIN_LOCK_SECONDS` | `60` | 登录失败锁定时长（秒） |
+| `CORS_ORIGIN` | 空 | 跨域白名单，同源部署留空 |
+| `HISTORY_RETENTION_DAYS` | `0` | 历史日志 / 统计派生数据保留天数，0 表示不清理（审计日志永不自动清理） |
+
+启动后浏览器访问 `http://<服务器>:3456/`：
+
+- 未登录只显示看板「首页」与「登录」按钮；
+- 点击登录，使用初始超级管理员 `admin` 与控制台打印的随机密码登录（若配置了 `DEFAULT_ADMIN_PASSWORD` 则使用该值；登录后请立即在右上角「修改密码」中改掉）；
+- 进入 `/admin` 后可在「用户权限」中创建账号并勾选看板页面、后台页面与按钮动作。
+
+### 6. 启动服务
 
 数据库初始化和前端构建完成后，启动 Node.js 后端服务：
 
@@ -439,7 +606,9 @@ npm run dev           # 终端 2：启动前端开发服务器（http://localhos
 - **刷新保持当前模块**：当前模块同步写入 URL hash（如 `#device`），初始化时从 hash 恢复页面并监听 `hashchange`，因此浏览器刷新、前进后退或直接打开带 hash 的地址都会停留在对应模块，不会回到首页。
 - **统计完全来源于工艺数据**：统计不预设 0 行、不引用设备档案补齐设备，而是逐条读取 `process_data`，按 `collect_time` 归属到「日期 × 班次 × 设备」后累加，因此每一行统计都能追溯到来源记录；重算时先删除区间内旧数据再整体写入，保证可重复执行且不会累加错乱。全量重算（`all: true` / `--all`）会清空整表后按当前全部工艺记录重建。
 - **设备启用状态参与统计**：统计前先取 `devices.is_active = 1` 的设备集合，未启用设备（停用 / 报废）的工艺记录直接跳过，接口返回 `skippedRecords`（跳过的记录数）与 `inactiveDevices`（涉及设备编号），页面会提示跳过情况；设备重新启用后再次统计即可恢复其统计行。
-- **计划完成度实时聚合**：`production_plans` 只保存计划本身（设备、产品、计划数、周期），不保存完成数；查询时用子查询按「设备 + 计划周期 + 可选产品」实时统计 `process_data` 记录数，产线一有新记录计划进度立刻变化，不需要定时重算；页面每 15 秒轮询刷新进行中计划，可手动暂停。
+- **计划完成度按执行段实时聚合**：`production_plans` 只保存计划本身（设备、产品、计划数、周期），完成数由子查询实时统计；统计条件除「设备 + 计划周期 + 可选产品 + 设备启用」外，还要求记录落在 `production_plan_segments` 的某个执行区间内（`started_at ~ ended_at`，未关闭的段统计到当前时间），因此暂停期间的其他产出不会串入本计划。产线一有新记录计划进度立刻变化，不需要定时重算；页面每 15 秒轮询刷新计划。
+- **执行段维护**：进入执行中开段，暂停 / 完成 / 取消关段，撤回或恢复起草清空；老库升级时按已有状态自动补建一条历史段（执行中统计到当前，暂停统计到暂停时刻，完成 / 结案 / 取消沿用原计划周期），保证历史数字不跳变。
+- **计划状态机在服务端强制校验**：`PLAN_TRANSITIONS` 定义合法流转（起草→下达→执行中⇄暂停→完成→结案，另有取消与恢复起草），非法流转返回 400；排产要素（编号/设备/产品/计划数/周期）在下达后锁定，避免已生效计划被静默改动；每次流转写入 `production_plan_logs` 供追溯。
 - **设备口径统一**：设备档案是唯一设备来源，`device_code` 作为业务主键贯穿首页监控、工艺数据、分析筛选与列表展示；服务启动时 `ensureDeviceCodes()` 会把旧库的 `DEV-xxx` 编号按设备名称统一为工艺采集编号，并把工艺数据中出现但未登记的编号自动补登记，保证各页面设备一致。
 - **弹窗交互**：安灯、管路等模块的交互提示统一使用 `AppDialog.vue` 内置弹窗（支持 `input` / `confirm` / `alert` 三种模式），替代浏览器原生 `prompt()` / `alert()`，以保证在内嵌 WebView 中可用。
 - **热成像热力图**：由点位温度实时生成内联 SVG（`v-html` 渲染），替代 `data:image/svg+xml` URI，规避部分 WebView 对长 Data URI 的兼容问题。
@@ -462,58 +631,13 @@ npm run dev           # 终端 2：启动前端开发服务器（http://localhos
 - 日志同时输出到控制台，方便实时查看
 - `server.log` 已被 `.gitignore` 排除，不会提交到仓库
 
-## 自动化测试
-
-内置 `node:test` 测试，无额外依赖；使用独立测试库与独立端口，不影响正式数据。
-
-```bash
-npm test          # 接口与业务规则（10 个用例，约 3 秒）
-npm run test:perf # 10 万条数据容量测试（约 30 秒）
-```
-
-覆盖范围（对应《管理系统代码审核与测试要点》的测试缺口）：
-
-| 序号 | 用例 | 断言要点 |
-|---|---|---|
-| 1 | 分页参数边界 | `page=0`、`pageSize=0/-5/abc/1000000` 收敛到 1~200 |
-| 2 | 非法 id 容错 | 删除接口传 `abc/null/{}/空` 返回 400/404，服务仍存活 |
-| 3 | 导出 | 默认近一个月、空区间只有表头、UTF-8 BOM、`=1+1` 公式注入被加单引号前缀 |
-| 4 | 并发重新统计 | 两次并发全量重建都成功且汇总一致，不出现半截数据 |
-| 5 | 鉴权 | 启用令牌后无令牌 POST 返回 401、带令牌正常、GET 与导出不受影响 |
-| 6 | 跨域 | 默认不下发 CORS 头；配置白名单后只对白名单来源放行 |
-| 7 | 请求体保护 | 2MB body 返回 413，非法 JSON 返回 400 |
-| 8 | 计划状态机 | 已完成不可恢复/取消，编辑接口不能绕过状态机 |
-| 9 | 设备编号同步 | 改编号后 `process_data` 关联行同步更新 |
-| 10 | 统计一致性 | 统计生产数 = 工艺记录数 = 合格 + 预警 + 不合格 |
-| 11 | 容量 | 10 万条数据下列表/曲线/分析/导出耗时在阈值内 |
-| 12 | 小屏适配 | 1366×768 下首页/工艺/统计/计划/曲线均无横向滚动 |
-
-浏览器相关用例（XSS 转义、小屏适配）的数据准备：
-
-```bash
-node tests/e2e-prepare.js
-PORT=3990 DB_PATH=tests/tmp/e2e.db node server.js
-# 打开 http://127.0.0.1:3990/#andon 与 /admin#device
-# 确认 window.__xss 未被置位、页面中不存在 <img src=x>（payload 以纯文本显示）
-```
-
-测试结构：
-
-```
-tests/
-├── setup.js        # 测试库初始化（执行 init_all.sql + 灌入工艺数据）与服务启停
-├── api.test.js     # 接口与业务规则（第 1-10 项）
-├── perf.test.js    # 容量测试（第 11 项）
-└── e2e-prepare.js  # 浏览器用例的数据准备（第 7/12 项）
-```
-
 ## 验证数据库
 
 ```bash
-node -e "const Database=require('better-sqlite3');const db=new Database('mesmonitor.db');const tables=['devices','device_status','device_status_history','products','thermal_records','thermal_point_temps','thermal_alarm_config','molds','mold_recipes','pipeline_params','pipeline_edit_log','andon_call_types','andon_calls','andon_call_logs','process_data','analysis_standard_versions','analysis_standards','analysis_standard_logs','shift_config','production_stats','production_plans'];tables.forEach(t=>{const r=db.prepare('SELECT COUNT(*) AS cnt FROM '+t).get();console.log(t.padEnd(30)+': '+r.cnt+' 条');});db.close()"
+node -e "const Database=require('better-sqlite3');const db=new Database('mesmonitor.db');const tables=['devices','device_status','device_status_history','products','thermal_records','thermal_point_temps','thermal_alarm_config','molds','mold_recipes','pipeline_params','pipeline_edit_log','andon_call_types','andon_calls','andon_call_logs','process_data','analysis_standard_versions','analysis_standards','analysis_standard_logs','shift_config','production_stats','production_plans','production_plan_logs','production_plan_segments'];tables.forEach(t=>{const r=db.prepare('SELECT COUNT(*) AS cnt FROM '+t).get();console.log(t.padEnd(30)+': '+r.cnt+' 条');});db.close()"
 ```
 
-> 输出共 21 张表的记录数，便于确认各模块数据是否初始化成功。
+> 输出共 23 张表的记录数，便于确认各模块数据是否初始化成功。
 
 ## 生成模拟数据
 
@@ -543,6 +667,8 @@ node stats_job.js --port 4000        # 指定后端端口（默认 3456）
 ```
 
 执行结果同时输出到控制台与 `stats_job.log`，日志中的「来源记录」即为本次参与统计的 `process_data` 记录数。历史数据补全或核对口径时，使用 `--all` 一次性按当前表内全部记录重建。
+
+> 服务启用登录鉴权后，脚本需携带机器令牌：设置环境变量 `ADMIN_TOKEN`（与服务端一致）或用 `--token <令牌>` 传入；未配置时脚本会收到 401 并给出提示。
 
 **Windows 计划任务（每天 00:10 重算前一天+当天）**
 
@@ -582,7 +708,7 @@ A: WebView 不支持浏览器原生 `prompt()`。本项目安灯模块已改用�
 A: 需要重新执行 `npm run build` 生成新的 `dist/` 产物（生产模式），或使用 `npm run dev` 开发模式（自动热更新）。
 
 **Q: 首次部署需要几步？**
-A: 三步：① `npm install` 安装依赖 → ② 初始化数据库（步骤 3 命令）→ ③ `npm run build` 构建前端 → `node server.js` 启动服务。
+A: 四步：① `npm install` 安装依赖 → ② 初始化数据库（步骤 3 命令）→ ③ `npm run build` 构建前端 → ④ `node server.js` 启动服务。移植到另一台服务器时按步骤 5 的文件清单拷贝。
 
 **Q: 如何让不同时间段的数据使用不同分析标准？**
 A: 进入「历史工件分析 → 标准管理」，先「新建版本」（填写生效开始/结束时间），再为该版本维护标准参数；也可直接写库：向 `analysis_standard_versions` 插入版本记录后，向 `analysis_standards` 插入该版本的参数标准。系统按每条工艺记录的 `collect_time` 自动匹配当时生效的版本，历史数据不会被新标准改写。

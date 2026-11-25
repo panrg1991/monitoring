@@ -1,4 +1,16 @@
 // API 请求工具
+// 会话失效（401）回调：由 auth.js 注册，用于清理前端登录态
+let unauthorizedHandler = null;
+
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = typeof fn === 'function' ? fn : null;
+}
+
+function withCredentials(options = {}) {
+  // 同源请求默认携带 Cookie；显式声明避免被后续改动误伤
+  return { credentials: 'same-origin', ...options };
+}
+
 async function parseResponse(res) {
   let data = null;
   try {
@@ -6,59 +18,30 @@ async function parseResponse(res) {
   } catch {
     data = null;
   }
+  if (res.status === 401 && unauthorizedHandler) unauthorizedHandler();
   if (!res.ok) {
     const msg = (data && data.error) || `HTTP ${res.status}`;
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
 
 export async function apiGet(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, withCredentials());
   return parseResponse(res);
 }
 
-const TOKEN_KEY = 'mes_admin_token';
-
-export function setAdminToken(token) {
-  try {
-    localStorage.setItem(TOKEN_KEY, String(token || ''));
-  } catch {
-    // 隐私模式下 localStorage 不可用时忽略
-  }
-}
-
-function getAdminToken() {
-  try {
-    return localStorage.getItem(TOKEN_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-// 从地址栏 ?token= 读取一次并保存，随后清理 URL，避免凭据留在浏览器历史里
-export function initAdminTokenFromUrl() {
-  try {
-    const url = new URL(window.location.href);
-    const token = url.searchParams.get('token');
-    if (!token) return;
-    setAdminToken(token);
-    url.searchParams.delete('token');
-    window.history.replaceState({}, '', `${url.pathname}${url.hash}`);
-  } catch {
-    // 忽略解析异常
-  }
-}
-
+// 注意：浏览器端不再支持也不保存 X-Admin-Token。
+// 机器令牌等同超级管理员，一旦写入 localStorage 会被 XSS 或共享终端窃取，
+// 仅允许 stats_job.js 等服务端脚本通过环境变量携带。
 export async function apiPost(url, body) {
-  const headers = { 'Content-Type': 'application/json' };
-  const token = getAdminToken();
-  if (token) headers['X-Admin-Token'] = token;
-  const res = await fetch(url, {
+  const res = await fetch(url, withCredentials({
     method: 'POST',
-    headers,
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {}),
-  });
+  }));
   return parseResponse(res);
 }
 

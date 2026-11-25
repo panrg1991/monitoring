@@ -53,7 +53,11 @@ function addDays(dateStr, n) {
 }
 
 function parseArgs(argv) {
-  const opts = { all: false, days: null, date: null, from: null, to: null, loop: 0, port: 3456, host: '127.0.0.1' };
+  const opts = {
+    all: false, days: null, date: null, from: null, to: null, loop: 0, port: 3456, host: '127.0.0.1',
+    // 机器令牌：服务端配置了 ADMIN_TOKEN 时必须携带（脚本无人值守，无需登录 Cookie）
+    token: (process.env.ADMIN_TOKEN || '').trim(),
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => argv[i + 1];
@@ -65,6 +69,7 @@ function parseArgs(argv) {
     else if (arg === '--loop') { opts.loop = Number(next()) || 60; i += 1; }
     else if (arg === '--port') { opts.port = Number(next()) || 3456; i += 1; }
     else if (arg === '--host') { opts.host = next() || '127.0.0.1'; i += 1; }
+    else if (arg === '--token') { opts.token = String(next() || '').trim(); i += 1; }
   }
   return opts;
 }
@@ -89,14 +94,19 @@ async function runOnce(opts) {
   const scopeText = opts.all ? '全量' : `${range.startDate}~${range.endDate}`;
   const url = `http://${opts.host}:${opts.port}/api/stats/rebuild`;
   try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (opts.token) headers['X-Admin-Token'] = opts.token;
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(range),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       log(`统计失败 ${scopeText}：${data.error || 'HTTP ' + res.status}`);
+      if (res.status === 401) {
+        log('提示：服务已启用登录鉴权，请通过环境变量 ADMIN_TOKEN 或 --token 传入与服务端一致的机器令牌');
+      }
       return false;
     }
     log(`统计完成 ${scopeText}（${data.startDate}~${data.endDate}）：模式=${data.mode === 'shift' ? '按班次' : '按天'}，` +

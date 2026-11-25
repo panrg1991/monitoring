@@ -7,7 +7,7 @@
           <i class="live-dot"></i>
           {{ autoRefresh ? `实时刷新中 · ${refreshLeft}s` : '实时刷新已暂停' }}
         </span>
-        <button v-if="isAdmin" class="refresh-btn" @click="openCreate">+ 新增计划</button>
+        <button v-if="isAdmin && can('plan', 'create')" class="refresh-btn" @click="openCreate">+ 新增计划</button>
       </div>
     </div>
 
@@ -15,36 +15,43 @@
       <div class="stat-item">
         <div class="stat-icon total">&#128203;</div>
         <div class="stat-info">
+          <div class="stat-num">{{ summary.draft }}</div>
+          <div class="stat-label">起草中</div>
+        </div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-icon offline">&#128229;</div>
+        <div class="stat-info">
+          <div class="stat-num">{{ summary.issued }}</div>
+          <div class="stat-label">已下达</div>
+        </div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-icon running">&#9881;</div>
+        <div class="stat-info">
           <div class="stat-num">{{ summary.running }}</div>
-          <div class="stat-label">进行中计划</div>
+          <div class="stat-label">执行中</div>
         </div>
       </div>
       <div class="stat-item">
-        <div class="stat-icon offline">&#127919;</div>
+        <div class="stat-icon warning">&#9208;</div>
         <div class="stat-info">
-          <div class="stat-num">{{ summary.runningPlanCount }}</div>
-          <div class="stat-label">计划数合计</div>
+          <div class="stat-num">{{ summary.paused }}</div>
+          <div class="stat-label">已暂停</div>
         </div>
       </div>
       <div class="stat-item">
-        <div class="stat-icon running">&#9989;</div>
+        <div class="stat-icon error">&#9989;</div>
         <div class="stat-info">
-          <div class="stat-num">{{ summary.runningActualCount }}</div>
-          <div class="stat-label">已完成（进行中）</div>
+          <div class="stat-num">{{ summary.completed + summary.closed }}</div>
+          <div class="stat-label">完成 / 结案</div>
         </div>
       </div>
       <div class="stat-item">
-        <div class="stat-icon warning">&#128200;</div>
+        <div class="stat-icon total">&#128200;</div>
         <div class="stat-info">
           <div class="stat-num">{{ summary.runningRate }}%</div>
-          <div class="stat-label">整体完成率</div>
-        </div>
-      </div>
-      <div class="stat-item">
-        <div class="stat-icon error">&#128220;</div>
-        <div class="stat-info">
-          <div class="stat-num">{{ summary.completed }}</div>
-          <div class="stat-label">已结束计划</div>
+          <div class="stat-label">执行中完成率</div>
         </div>
       </div>
     </div>
@@ -68,8 +75,12 @@
           <label>状态</label>
           <select v-model="filter.status">
             <option value="">全部状态</option>
-            <option value="running">进行中</option>
+            <option value="draft">起草中</option>
+            <option value="issued">已下达</option>
+            <option value="running">执行中</option>
+            <option value="paused">已暂停</option>
             <option value="completed">已完成</option>
+            <option value="closed">已结案</option>
             <option value="cancelled">已取消</option>
           </select>
         </div>
@@ -108,8 +119,9 @@
                 <th>已完成</th>
                 <th style="min-width:190px;">完成率</th>
                 <th>计划周期</th>
+                <th style="width:150px;">实际开始 / 结束</th>
                 <th>状态</th>
-                <th style="width:190px;">操作</th>
+                <th style="width:300px;">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -137,23 +149,44 @@
                   {{ shortTime(p.start_time) }}<br />
                   {{ shortTime(p.end_time) }}
                 </td>
+                <td class="time-cell actual-cell">
+                  <span :title="p.exec_start_at || p.started_at || ''">{{ shortTime(p.exec_start_at || p.started_at) }}</span><br />
+                  <span :title="p.exec_end_at || p.completed_at || ''">{{ shortTime(p.exec_end_at || p.completed_at) }}</span>
+                </td>
                 <td>
                   <span class="status-tag" :class="statusClass(p)">{{ statusText(p) }}</span>
                 </td>
                 <td>
                   <template v-if="isAdmin">
-                    <button v-if="p.status === 'running'" class="link-btn" @click="openEdit(p)">编辑</button>
-                    <button v-if="p.status === 'running'" class="link-btn" @click="changeStatus(p, 'completed', '已结束')">结束</button>
-                    <button v-if="p.status === 'running'" class="link-btn" @click="changeStatus(p, 'cancelled', '已取消')">取消</button>
-                    <button v-if="p.status !== 'running'" class="link-btn" @click="changeStatus(p, 'running', '已恢复进行中')">恢复</button>
-                    <button class="link-btn danger" @click="askDelete(p)">删除</button>
+                    <button class="link-btn" @click="openRecords(p)">查询</button>
+                    <!-- 起草：编辑 / 下达 / 取消 -->
+                    <button v-if="p.status === 'draft' && can('plan', 'update')" class="link-btn" @click="openEdit(p)">编辑</button>
+                    <button v-if="p.status === 'draft' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'issued', '已下达')">下达</button>
+                    <button v-if="p.status === 'draft' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'cancelled', '已取消')">取消</button>
+                    <!-- 已下达：开始执行 / 撤回为起草 / 取消 -->
+                    <button v-if="p.status === 'issued' && can('plan', 'operate')" class="link-btn" @click="askStart(p)">开始</button>
+                    <button v-if="p.status === 'issued' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'draft', '已撤回为起草')">撤回</button>
+                    <button v-if="p.status === 'issued' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'cancelled', '已取消')">取消</button>
+                    <!-- 执行中：暂停 / 完成 -->
+                    <button v-if="p.status === 'running' && can('plan', 'update')" class="link-btn" @click="openEdit(p)">编辑</button>
+                    <button v-if="p.status === 'running' && can('plan', 'operate')" class="link-btn" @click="askPause(p)">暂停</button>
+                    <button v-if="p.status === 'running' && can('plan', 'operate')" class="link-btn" @click="askComplete(p)">完成</button>
+                    <!-- 已暂停：恢复执行 / 取消 -->
+                    <button v-if="p.status === 'paused' && can('plan', 'update')" class="link-btn" @click="openEdit(p)">编辑</button>
+                    <button v-if="p.status === 'paused' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'running', '已恢复执行')">恢复</button>
+                    <button v-if="p.status === 'paused' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'cancelled', '已取消')">取消</button>
+                    <!-- 已完成：结案 -->
+                    <button v-if="p.status === 'completed' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'closed', '已结案')">结案</button>
+                    <!-- 已取消：恢复为起草 -->
+                    <button v-if="p.status === 'cancelled' && can('plan', 'operate')" class="link-btn" @click="changeStatus(p, 'draft', '已恢复为起草')">恢复起草</button>
+                    <button v-if="canDelete(p) && can('plan', 'delete')" class="link-btn danger" @click="askDelete(p)">删除</button>
                   </template>
                   <span v-else class="sub-text">--</span>
                 </td>
               </tr>
               <tr v-if="!rows.length">
-                <td colspan="11" style="text-align:center;color:var(--text-secondary);padding:30px 0;">
-                  暂无生产计划，点击「新增计划」为设备下达计划数
+                <td colspan="12" style="text-align:center;color:var(--text-secondary);padding:30px 0;">
+                  暂无生产计划，点击「新增计划」创建起草计划，下达后开始执行
                 </td>
               </tr>
             </tbody>
@@ -206,14 +239,54 @@
       @confirm="handleDelete"
       @cancel="confirmState.visible = false"
     />
+
+    <PlanRecordsDialog
+      :visible="recordsState.visible"
+      :plan="recordsState.plan"
+      @close="recordsState.visible = false"
+    />
+
+    <AppDialog
+      :visible="pauseState.visible"
+      title="暂停计划"
+      :message="pauseState.message"
+      mode="input"
+      placeholder="请填写暂停原因（必填）"
+      @confirm="handlePause"
+      @cancel="pauseState.visible = false"
+    />
+
+    <AppDialog
+      :visible="startState.visible"
+      title="开始执行计划"
+      :message="startState.message"
+      mode="input"
+      input-type="datetime-local"
+      :default-value="startState.defaultValue"
+      @confirm="handleStart"
+      @cancel="startState.visible = false"
+    />
+
+    <AppDialog
+      :visible="completeState.visible"
+      title="完成计划"
+      :message="completeState.message"
+      mode="input"
+      input-type="datetime-local"
+      :default-value="completeState.defaultValue"
+      @confirm="handleComplete"
+      @cancel="completeState.visible = false"
+    />
   </section>
 </template>
 
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import { apiGet, apiPost, buildPageList } from '../api';
+import { can } from '../auth';
 import { loadPageState, savePageState } from '../usePageState';
 import PlanEditDialog from './PlanEditDialog.vue';
+import PlanRecordsDialog from './PlanRecordsDialog.vue';
 import AppDialog from '../AppDialog.vue';
 
 const props = defineProps({
@@ -230,8 +303,12 @@ const rows = ref([]);
 const options = ref({ devices: [], products: [] });
 const summary = ref({
   total: 0,
+  draft: 0,
+  issued: 0,
   running: 0,
+  paused: 0,
   completed: 0,
+  closed: 0,
   cancelled: 0,
   runningPlanCount: 0,
   runningActualCount: 0,
@@ -249,6 +326,10 @@ const loading = ref(false);
 const dialogVisible = ref(false);
 const editingPlan = ref(null);
 const confirmState = ref({ visible: false, message: '', plan: null });
+const pauseState = ref({ visible: false, message: '', plan: null });
+const recordsState = ref({ visible: false, plan: null });
+const startState = ref({ visible: false, message: '', plan: null, defaultValue: '' });
+const completeState = ref({ visible: false, message: '', plan: null, defaultValue: '' });
 const autoRefresh = ref(true);
 const refreshLeft = ref(REFRESH_SECONDS);
 
@@ -271,16 +352,42 @@ function shortTime(value) {
   return s.length >= 16 ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : s;
 }
 
+const STATUS_TEXT = {
+  draft: '起草中',
+  issued: '已下达',
+  running: '执行中',
+  paused: '已暂停',
+  completed: '已完成',
+  closed: '已结案',
+  cancelled: '已取消',
+};
+
+const STATUS_CLASS = {
+  draft: 'draft',
+  issued: 'issued',
+  running: 'running',
+  paused: 'paused',
+  completed: 'done',
+  closed: 'closed',
+  cancelled: 'cancel',
+};
+
 function statusText(p) {
-  if (p.status === 'completed') return '已完成';
-  if (p.status === 'cancelled') return '已取消';
-  return Number(p.overdue) === 1 ? '已超期' : '进行中';
+  if (Number(p.overdue) === 1) {
+    if (p.status === 'running') return '已超期';
+    if (p.status === 'issued') return '逾期未执行';
+  }
+  return STATUS_TEXT[p.status] || p.status;
 }
 
 function statusClass(p) {
-  if (p.status === 'completed') return 'done';
-  if (p.status === 'cancelled') return 'cancel';
-  return Number(p.overdue) === 1 ? 'overdue' : 'running';
+  if (Number(p.overdue) === 1 && ['running', 'issued'].includes(p.status)) return 'overdue';
+  return STATUS_CLASS[p.status] || 'cancel';
+}
+
+// 仅起草 / 已取消的计划可删除，其余需先取消
+function canDelete(p) {
+  return p.status === 'draft' || p.status === 'cancelled';
 }
 
 function progressWidth(p) {
@@ -379,6 +486,11 @@ function openEdit(plan) {
   dialogVisible.value = true;
 }
 
+// 查询该计划关联的工艺数据（与完成数统计口径一致）
+function openRecords(plan) {
+  recordsState.value = { visible: true, plan };
+}
+
 function onSaved() {
   flash('计划已保存');
   loadPlans(true);
@@ -391,6 +503,97 @@ async function changeStatus(plan, status, text) {
     loadPlans(true);
   } catch (e) {
     flash(e.message || '操作失败');
+  }
+}
+
+// datetime-local 的当前值（YYYY-MM-DDTHH:mm）
+function nowLocalInput() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// 开始执行：默认当前时间，可回填为实际开始时间（补录场景）
+function askStart(plan) {
+  startState.value = {
+    visible: true,
+    plan,
+    defaultValue: nowLocalInput(),
+    message: `开始执行计划【${plan.plan_code}${plan.plan_name ? ' ' + plan.plan_name : ''}】，如需补录请改为实际开始时间：`,
+  };
+}
+
+async function handleStart(value) {
+  const plan = startState.value.plan;
+  const occurred = String(value || '').trim();
+  if (!occurred) {
+    flash('请填写开始执行时间');
+    return;
+  }
+  startState.value.visible = false;
+  if (!plan) return;
+  try {
+    await apiPost('/api/plans/status', { id: plan.id, status: 'running', occurred_at: occurred });
+    flash(`计划【${plan.plan_code}】已开始执行`);
+    loadPlans(true);
+  } catch (e) {
+    flash(e.message || '操作失败');
+  }
+}
+
+// 完成：默认当前时间，可回填为实际完成时间
+function askComplete(plan) {
+  completeState.value = {
+    visible: true,
+    plan,
+    defaultValue: nowLocalInput(),
+    message: `完成计划【${plan.plan_code}${plan.plan_name ? ' ' + plan.plan_name : ''}】，请确认实际完成时间（需晚于本次开始执行时间）：`,
+  };
+}
+
+async function handleComplete(value) {
+  const plan = completeState.value.plan;
+  const occurred = String(value || '').trim();
+  if (!occurred) {
+    flash('请填写完成时间');
+    return;
+  }
+  completeState.value.visible = false;
+  if (!plan) return;
+  try {
+    await apiPost('/api/plans/status', { id: plan.id, status: 'completed', occurred_at: occurred });
+    flash(`计划【${plan.plan_code}】已完成`);
+    loadPlans(true);
+  } catch (e) {
+    flash(e.message || '操作失败');
+  }
+}
+
+// 暂停计划：必须填写暂停原因（异常说明），写入流转日志
+function askPause(plan) {
+  pauseState.value = {
+    visible: true,
+    plan,
+    message: `暂停计划【${plan.plan_code}${plan.plan_name ? ' ' + plan.plan_name : ''}】，请填写暂停原因：`,
+  };
+}
+
+async function handlePause(reason) {
+  const plan = pauseState.value.plan;
+  const remark = String(reason || '').trim();
+  if (!remark) {
+    flash('请填写暂停原因');
+    return;
+  }
+  pauseState.value.visible = false;
+  if (!plan) return;
+  try {
+    await apiPost('/api/plans/status', { id: plan.id, status: 'paused', remark });
+    flash(`计划【${plan.plan_code}】已暂停`);
+    loadPlans(true);
+  } catch (e) {
+    flash(e.message || '暂停失败');
   }
 }
 
@@ -600,8 +803,12 @@ onBeforeUnmount(stopTimer);
   white-space: nowrap;
 }
 
+.status-tag.draft { background: rgba(140, 155, 175, 0.15); color: #9aa8bb; }
+.status-tag.issued { background: rgba(59, 130, 246, 0.15); color: #6ea8ff; }
 .status-tag.running { background: rgba(24, 144, 255, 0.12); color: #40a9ff; }
+.status-tag.paused { background: rgba(250, 173, 20, 0.15); color: #faad14; }
 .status-tag.done { background: rgba(82, 196, 26, 0.15); color: #52c41a; }
+.status-tag.closed { background: rgba(82, 196, 26, 0.08); color: #7bc96f; }
 .status-tag.overdue { background: rgba(250, 173, 20, 0.15); color: #faad14; }
 .status-tag.cancel { background: rgba(140, 155, 175, 0.15); color: #8ba3c7; }
 

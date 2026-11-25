@@ -6,7 +6,7 @@
 
     <div class="andon-container">
       <div class="module-title">快捷呼叫</div>
-      <div class="andon-grid">
+      <div v-if="can('andon', 'create')" class="andon-grid">
         <div
           v-for="t in andonTypes"
           :key="t.id"
@@ -20,7 +20,11 @@
         </div>
       </div>
 
-      <div class="custom-call-section">
+      <div v-if="!can('andon', 'create')" class="module-title" style="color:var(--text-secondary);font-weight:400;font-size:13px;">
+        当前账号没有发起呼叫权限，可查看呼叫记录
+      </div>
+
+      <div v-if="can('andon', 'create')" class="custom-call-section">
         <h3>自定义呼叫</h3>
         <div class="custom-input-row">
           <input v-model="customCall.type" placeholder="呼叫类型（如：设备故障）" />
@@ -57,7 +61,7 @@
               <td>{{ c.call_time }}</td>
               <td>{{ c.handler || '--' }}</td>
               <td>
-                <template v-if="isAdmin">
+                <template v-if="isAdmin && can('andon', 'respond')">
                   <button v-if="c.status === 'pending'" class="btn-action" @click="openRespondDialog(c)">响应</button>
                   <button v-else-if="c.status === 'processing'" class="btn-action btn-action-complete" @click="openCompleteDialog(c)">完成</button>
                   <span v-else style="color:var(--text-secondary);font-size:12px;">--</span>
@@ -122,6 +126,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import { apiGet, apiPost, escapeHtml } from '../api';
+import { can } from '../auth';
 import AppDialog from '../AppDialog.vue';
 
 const props = defineProps({

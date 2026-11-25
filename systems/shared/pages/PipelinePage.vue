@@ -30,7 +30,7 @@
         </div>
       </div>
 
-      <div class="pipeline-right" v-if="isAdmin">
+      <div class="pipeline-right" v-if="isAdmin && can('pipeline', 'update')">
         <h2>参数下发</h2>
         <div class="pipeline-edit-form">
           <div class="form-group">
@@ -67,6 +67,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import { apiGet, apiPost } from '../api';
+import { can } from '../auth';
 import AppDialog from '../AppDialog.vue';
 
 const props = defineProps({

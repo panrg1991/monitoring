@@ -3,7 +3,7 @@
     <div class="dashboard-header">
       <h1 class="dashboard-title">产品管理</h1>
       <div class="header-actions">
-        <button class="refresh-btn" @click="openCreate">+ 新增产品</button>
+        <button v-if="can('product', 'create')" class="refresh-btn" @click="openCreate">+ 新增产品</button>
       </div>
     </div>
 
@@ -89,8 +89,8 @@
                 </td>
                 <td>{{ p.updated_at || p.created_at || '--' }}</td>
                 <td>
-                  <button class="link-btn" @click="openEdit(p)">编辑</button>
-                  <button class="link-btn danger" @click="askDelete(p)">删除</button>
+                  <button v-if="can('product', 'update')" class="link-btn" @click="openEdit(p)">编辑</button>
+                  <button v-if="can('product', 'delete')" class="link-btn danger" @click="askDelete(p)">删除</button>
                 </td>
               </tr>
               <tr v-if="!products.length && !loading">
@@ -125,6 +125,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue';
 import { apiGet, apiPost } from '../../shared/api';
+import { can } from '../../shared/auth';
 import ProductEditDialog from './ProductEditDialog.vue';
 import AppDialog from '../../shared/AppDialog.vue';
 

@@ -8,6 +8,7 @@
           v-if="mode === 'input'"
           v-model="inputValue"
           class="app-dialog-input"
+          :type="inputType"
           :placeholder="placeholder"
           @keyup.enter="handleConfirm"
           autofocus
@@ -30,6 +31,10 @@ const props = defineProps({
   message: { type: String, default: '' },
   mode: { type: String, default: 'confirm' }, // 'confirm' | 'input' | 'alert'
   placeholder: { type: String, default: '' },
+  // 输入框类型：text（默认）/ datetime-local / date / number 等
+  inputType: { type: String, default: 'text' },
+  // 输入框默认值（弹窗打开时填入，可用于预填当前时间）
+  defaultValue: { type: String, default: '' },
 });
 
 const emit = defineEmits(['confirm', 'cancel', 'update:visible']);
@@ -39,7 +44,7 @@ const inputValue = ref('');
 watch(
   () => props.visible,
   (val) => {
-    if (val) inputValue.value = '';
+    if (val) inputValue.value = props.defaultValue || '';
   }
 );
 
@@ -100,6 +105,7 @@ function handleCancel() {
   font-size: 14px;
   outline: none;
   margin-top: 6px;
+  color-scheme: dark;
 }
 .app-dialog-input:focus {
   border-color: #3b82f6;

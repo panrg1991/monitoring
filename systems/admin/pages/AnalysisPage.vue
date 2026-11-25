@@ -4,7 +4,7 @@
       <h1 class="dashboard-title">历史工件分析</h1>
       <div class="header-actions">
         <span class="data-source-tag">数据来源：工艺数据表 process_data</span>
-        <button class="refresh-btn" @click="openStandardDialog">标准管理</button>
+        <button v-if="can('analysis', 'config')" class="refresh-btn" @click="openStandardDialog">标准管理</button>
       </div>
     </div>
 
@@ -172,6 +172,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import { apiGet, buildPageList, escapeHtml } from '../../shared/api';
+import { can } from '../../shared/auth';
 import HScrollBar from '../../shared/HScrollBar.vue';
 import AnalysisStandardDialog from './AnalysisStandardDialog.vue';
 
@@ -276,7 +277,7 @@ function analysisCellHtml(row, key) {
   const value = row[key];
   if (value == null || value === '') return '<span class="cell-in-range">--</span>';
   const std = row._stdMap ? row._stdMap[key] : null;
-  if (!std) return `<span class="cell-in-range">${value}</span>`;
+  if (!std) return `<span class="cell-in-range">${escapeHtml(value)}</span>`;
 
   const stdValue = Number(std.standard_value);
   const tol = Math.abs(Number(std.tolerance) || 0);
@@ -288,9 +289,9 @@ function analysisCellHtml(row, key) {
   let diffHtml = '';
   if (abs > tol) {
     const pct = stdValue ? ((abs / stdValue) * 100).toFixed(1) : '0';
-    diffHtml = `<span class="diff-value">${diff > 0 ? '+' : ''}${diff.toFixed(2)} (${pct}%)</span>`;
+    diffHtml = `<span class="diff-value">${escapeHtml(diff > 0 ? '+' : '')}${escapeHtml(diff.toFixed(2))} (${escapeHtml(pct)}%)</span>`;
   }
-  return `<span class="${cls}">${value}</span>${diffHtml}`;
+  return `<span class="${cls}">${escapeHtml(value)}</span>${diffHtml}`;
 }
 
 function analysisJudgeHtml(judge, detail) {

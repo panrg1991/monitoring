@@ -3,7 +3,7 @@
     <div class="dashboard-header">
       <h1 class="dashboard-title">模具档案</h1>
       <div class="header-actions">
-        <button class="refresh-btn" @click="openCreate">+ 新增模具</button>
+        <button v-if="can('mold', 'create')" class="refresh-btn" @click="openCreate">+ 新增模具</button>
       </div>
     </div>
 
@@ -103,8 +103,8 @@
                 </td>
                 <td>{{ m.updated_at || m.created_at || '--' }}</td>
                 <td>
-                  <button class="link-btn" @click="openEdit(m)">编辑</button>
-                  <button class="link-btn danger" @click="askDelete(m)">删除</button>
+                  <button v-if="can('mold', 'update')" class="link-btn" @click="openEdit(m)">编辑</button>
+                  <button v-if="can('mold', 'delete')" class="link-btn danger" @click="askDelete(m)">删除</button>
                 </td>
               </tr>
               <tr v-if="!molds.length && !loading">
@@ -139,6 +139,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue';
 import { apiGet, apiPost } from '../../shared/api';
+import { can } from '../../shared/auth';
 import MoldEditDialog from './MoldEditDialog.vue';
 import AppDialog from '../../shared/AppDialog.vue';
 
